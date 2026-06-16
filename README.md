@@ -1,5 +1,7 @@
 # FACT Tokenizer MVP
 
+[中文版](README.zh-CN.md)
+
 First-stage FACT tokenizer prototype for learning ego-accessible shared action tokens from paired ego/exo video transitions.
 
 The current MVP supports:
