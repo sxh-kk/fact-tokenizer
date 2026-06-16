@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Local data and generated artifacts
+data/
+outputs/
+checkpoints/
+logs/
+runs/
+wandb/
+
+# Model/data artifacts
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.npz
+*.npy
+*.jsonl.tmp
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+*.key
+credentials
+credentials.*
+aws/
+.aws/
+
+# Vendored/upstream reproduction checkout. Keep instructions/scripts here,
+# but do not upload the full copied upstream repository.
+mvp_lam/
+reproduce_lam/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
