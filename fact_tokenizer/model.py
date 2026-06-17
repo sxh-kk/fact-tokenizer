@@ -128,7 +128,18 @@ class DINOv2PatchFeatureExtractor(nn.Module):
         super().__init__()
         if torch_home:
             os.environ.setdefault("TORCH_HOME", torch_home)
-        self.encoder = torch.hub.load("facebookresearch/dinov2", dino_model)
+        hub_root = Path(os.environ.get("TORCH_HOME", "")).expanduser() / "hub"
+        local_repo = hub_root / "facebookresearch_dinov2_main"
+        local_weights = hub_root / "checkpoints" / "dinov2_vitb14_reg4_pretrain.pth"
+        if local_repo.exists() and local_weights.exists() and dino_model == "dinov2_vitb14_reg":
+            self.encoder = torch.hub.load(
+                str(local_repo),
+                dino_model,
+                source="local",
+                weights=str(local_weights),
+            )
+        else:
+            self.encoder = torch.hub.load("facebookresearch/dinov2", dino_model)
         self.encoder.requires_grad_(False)
         self.register_buffer("mean", torch.tensor(IMAGENET_DEFAULT_MEAN).view(1, 1, 3, 1, 1), persistent=False)
         self.register_buffer("std", torch.tensor(IMAGENET_DEFAULT_STD).view(1, 1, 3, 1, 1), persistent=False)
@@ -307,7 +318,7 @@ class FACTTokenizer(nn.Module):
     def encode_views(self, batch: Mapping[str, Mapping[str, torch.Tensor]]) -> Dict[str, Dict[str, torch.Tensor]]:
         encoded: Dict[str, Dict[str, torch.Tensor]] = {}
         for view_name in self.view_names:
-            videos = batch[view_name]["videos"].to(self.device)
+            videos = batch[view_name]["videos"].to(self.device, non_blocking=True)
             if videos.ndim == 4:
                 videos = videos.unsqueeze(0)
             patch_features = self.feature_extractor(videos)
@@ -327,43 +338,206 @@ class FACTTokenizer(nn.Module):
         self,
         obs_view: Dict[str, torch.Tensor],
         act_view: Dict[str, torch.Tensor],
+        private_dropout: float = 0.0,
+        zero_private: bool = False,
+        action_slot_dropout: float = 0.0,
     ) -> torch.Tensor:
         current_tokens = self.patch_up(obs_view["current_patches"])
-        action_tokens = self.action_up(act_view["z_q"])
-        private_tokens = self.private_up(obs_view["r_priv"])
+        action = act_view["z_q"]
+        if self.training and action_slot_dropout > 0.0:
+            keep_prob = max(1.0 - float(action_slot_dropout), 0.0)
+            if keep_prob <= 0.0:
+                action = torch.zeros_like(action)
+            else:
+                mask = torch.rand((*action.shape[:-1], 1), device=action.device, dtype=action.dtype) < keep_prob
+                if action.shape[-2] > 1:
+                    empty = mask.sum(dim=-2, keepdim=True) == 0
+                    fallback = torch.zeros_like(mask)
+                    fallback[..., 0, :] = 1
+                    mask = torch.where(empty, fallback, mask)
+                action = action * mask
+        action_tokens = self.action_up(action)
+        private = obs_view["r_priv"]
+        if zero_private:
+            private = torch.zeros_like(private)
+        elif self.training and private_dropout > 0.0:
+            keep_prob = max(1.0 - float(private_dropout), 0.0)
+            if keep_prob <= 0.0:
+                private = torch.zeros_like(private)
+            else:
+                mask = torch.rand((*private.shape[:-1], 1), device=private.device, dtype=private.dtype) < keep_prob
+                private = private * mask
+        private_tokens = self.private_up(private)
         decoder_input = torch.cat([action_tokens, private_tokens, current_tokens], dim=2)
         return self.decoder(decoder_input, num_patch_tokens=current_tokens.shape[2])
 
-    def forward(self, batch: Mapping[str, Mapping[str, torch.Tensor]]) -> Dict[str, Dict[str, torch.Tensor]]:
+    def _make_shuffled_action_view(
+        self,
+        view: Dict[str, torch.Tensor],
+        take_index: torch.Tensor | None = None,
+        same_take: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        shuffled = dict(view)
+        batch = view["z_q"].shape[0]
+        if batch <= 1:
+            shuffled["z_q"] = view["z_q"]
+            return shuffled
+        if same_take and take_index is not None:
+            take_index = take_index.to(view["z_q"].device)
+            permutation = torch.arange(batch, device=view["z_q"].device)
+            for take in torch.unique(take_index):
+                members = torch.nonzero(take_index == take, as_tuple=False).flatten()
+                if members.numel() <= 1:
+                    continue
+                local = torch.randperm(members.numel(), device=view["z_q"].device)
+                fixed = local == torch.arange(members.numel(), device=view["z_q"].device)
+                if fixed.any():
+                    local = local.roll(1)
+                permutation[members] = members[local]
+        else:
+            permutation = torch.randperm(batch, device=view["z_q"].device)
+            fixed = permutation == torch.arange(batch, device=view["z_q"].device)
+            if fixed.any():
+                permutation = permutation.roll(1)
+        shuffled["z_q"] = view["z_q"].index_select(0, permutation)
+        return shuffled
+
+    def _add_reconstruction(
+        self,
+        reconstructions: Dict[str, Dict[str, torch.Tensor | str]],
+        name: str,
+        obs_view_name: str,
+        act_view_name: str,
+        views: Dict[str, Dict[str, torch.Tensor]],
+        private_dropout: float,
+        zero_private: bool = False,
+        shuffled_action: bool = False,
+        same_take_action: bool = False,
+        action_slot_dropout: float = 0.0,
+        loss_role: str = "base",
+        take_index: torch.Tensor | None = None,
+    ) -> None:
+        act_view = (
+            self._make_shuffled_action_view(views[act_view_name], take_index=take_index, same_take=same_take_action)
+            if shuffled_action
+            else views[act_view_name]
+        )
+        reconstructions[name] = {
+            "recon": self._decode_path(
+                views[obs_view_name],
+                act_view,
+                private_dropout=0.0 if zero_private else private_dropout,
+                zero_private=zero_private,
+                action_slot_dropout=action_slot_dropout,
+            ),
+            "target": views[obs_view_name]["target_patches"],
+            "current": views[obs_view_name]["current_patches"],
+            "obs_view": obs_view_name,
+            "act_view": act_view_name,
+            "loss_role": loss_role,
+        }
+
+    def forward(
+        self,
+        batch: Mapping[str, Mapping[str, torch.Tensor]],
+        private_dropout: float = 0.0,
+        action_slot_dropout: float = 0.0,
+        include_action_only: bool = False,
+        include_action_shuffle: bool = False,
+        include_same_take_action_shuffle: bool = False,
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
         views = self.encode_views(batch)
         ego_name, exo_name = self.view_names
-        reconstructions = {
-            "ego_self": {
-                "recon": self._decode_path(views[ego_name], views[ego_name]),
-                "target": views[ego_name]["target_patches"],
-                "obs_view": ego_name,
-                "act_view": ego_name,
-            },
-            "exo_self": {
-                "recon": self._decode_path(views[exo_name], views[exo_name]),
-                "target": views[exo_name]["target_patches"],
-                "obs_view": exo_name,
-                "act_view": exo_name,
-            },
-            "ego_swap": {
-                "recon": self._decode_path(views[ego_name], views[exo_name]),
-                "target": views[ego_name]["target_patches"],
-                "obs_view": ego_name,
-                "act_view": exo_name,
-            },
-            "exo_swap": {
-                "recon": self._decode_path(views[exo_name], views[ego_name]),
-                "target": views[exo_name]["target_patches"],
-                "obs_view": exo_name,
-                "act_view": ego_name,
-            },
+        take_index = batch[ego_name].get("take_index")
+        reconstructions: Dict[str, Dict[str, torch.Tensor | str]] = {}
+        base_specs = {
+            "ego_self": (ego_name, ego_name),
+            "exo_self": (exo_name, exo_name),
+            "ego_swap": (ego_name, exo_name),
+            "exo_swap": (exo_name, ego_name),
         }
-        return {"views": views, "reconstructions": reconstructions}
+        for name, (obs_view_name, act_view_name) in base_specs.items():
+            self._add_reconstruction(
+                reconstructions,
+                name,
+                obs_view_name,
+                act_view_name,
+                views,
+                private_dropout=private_dropout,
+                action_slot_dropout=action_slot_dropout,
+                loss_role="base",
+            )
+            if include_action_only:
+                self._add_reconstruction(
+                    reconstructions,
+                    f"{name}_no_private",
+                    obs_view_name,
+                    act_view_name,
+                    views,
+                    private_dropout=0.0,
+                    zero_private=True,
+                    action_slot_dropout=action_slot_dropout,
+                    loss_role="action_only",
+                )
+            if include_action_shuffle:
+                self._add_reconstruction(
+                    reconstructions,
+                    f"{name}_action_shuffle",
+                    obs_view_name,
+                    act_view_name,
+                    views,
+                    private_dropout=private_dropout,
+                    shuffled_action=True,
+                    action_slot_dropout=action_slot_dropout,
+                    loss_role="negative",
+                )
+                if include_action_only:
+                    self._add_reconstruction(
+                        reconstructions,
+                        f"{name}_no_private_action_shuffle",
+                        obs_view_name,
+                        act_view_name,
+                        views,
+                        private_dropout=0.0,
+                        zero_private=True,
+                        shuffled_action=True,
+                        action_slot_dropout=action_slot_dropout,
+                        loss_role="negative_no_private",
+                    )
+            if include_same_take_action_shuffle:
+                self._add_reconstruction(
+                    reconstructions,
+                    f"{name}_same_take_action_shuffle",
+                    obs_view_name,
+                    act_view_name,
+                    views,
+                    private_dropout=private_dropout,
+                    shuffled_action=True,
+                    same_take_action=True,
+                    action_slot_dropout=action_slot_dropout,
+                    loss_role="same_take_negative",
+                    take_index=take_index,
+                )
+                if include_action_only:
+                    self._add_reconstruction(
+                        reconstructions,
+                        f"{name}_no_private_same_take_action_shuffle",
+                        obs_view_name,
+                        act_view_name,
+                        views,
+                        private_dropout=0.0,
+                        zero_private=True,
+                        shuffled_action=True,
+                        same_take_action=True,
+                        action_slot_dropout=action_slot_dropout,
+                        loss_role="same_take_negative_no_private",
+                        take_index=take_index,
+                    )
+        return {
+            "views": views,
+            "reconstructions": reconstructions,
+            "take_index": take_index.to(self.device, non_blocking=True) if take_index is not None else None,
+        }
 
     @torch.inference_mode()
     def encode_shared_action(

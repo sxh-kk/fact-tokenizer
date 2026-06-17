@@ -9,13 +9,13 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterator
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,9 +41,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--discard-resume-history",
+        action="store_true",
+        help="Do not copy old per-step logs from a resumed checkpoint into newly saved checkpoints.",
+    )
     parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-persistent-workers", action="store_true")
+    parser.add_argument("--take-grouped-batches", action="store_true")
+    parser.add_argument("--samples-per-take", type=int, default=4)
+    parser.add_argument("--no-tf32", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--backbone", choices=["mock", "dino"], default="mock")
@@ -64,6 +74,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl-weight", type=float, default=0.1)
     parser.add_argument("--balance-weight", type=float, default=0.01)
     parser.add_argument("--private-reg-weight", type=float, default=0.001)
+    parser.add_argument("--private-dropout", type=float, default=0.0)
+    parser.add_argument("--private-dropout-start-fraction", type=float, default=0.1)
+    parser.add_argument("--private-dropout-ramp-fraction", type=float, default=0.3)
+    parser.add_argument("--action-slot-dropout", type=float, default=0.0)
+    parser.add_argument("--action-slot-dropout-start-fraction", type=float, default=0.15)
+    parser.add_argument("--action-slot-dropout-ramp-fraction", type=float, default=0.25)
+    parser.add_argument("--action-only-weight", type=float, default=0.0)
+    parser.add_argument("--action-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--no-private-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--action-contrast-margin", type=float, default=0.01)
+    parser.add_argument("--action-aux-start-fraction", type=float, default=0.2)
+    parser.add_argument("--action-aux-ramp-fraction", type=float, default=0.2)
+    parser.add_argument("--action-consistency-weight", type=float, default=0.0)
+    parser.add_argument("--assignment-entropy-weight", type=float, default=0.0)
+    parser.add_argument("--assignment-entropy-target", type=float, default=0.0)
+    parser.add_argument("--slot-balance-weight", type=float, default=0.0)
+    parser.add_argument("--hard-usage-balance-weight", type=float, default=0.0)
+    parser.add_argument("--slot-diversity-weight", type=float, default=0.0)
+    parser.add_argument("--motion-focus-weight", type=float, default=0.0)
+    parser.add_argument("--action-only-motion-focus-weight", type=float, default=0.0)
+    parser.add_argument("--motion-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--delta-focus-weight", type=float, default=0.0)
+    parser.add_argument("--action-only-delta-focus-weight", type=float, default=0.0)
+    parser.add_argument("--delta-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--motion-focus-gamma", type=float, default=2.0)
+    parser.add_argument("--motion-focus-max-weight", type=float, default=6.0)
+    parser.add_argument("--exo-aux-multiplier", type=float, default=1.0)
+    parser.add_argument("--teacher-ego-uncertainty-weight", type=float, default=0.0)
+    parser.add_argument("--teacher-disagreement-weight", type=float, default=0.0)
+    parser.add_argument("--teacher-base-bias", type=float, default=0.0)
+    parser.add_argument("--same-take-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--take-uniform-weight", type=float, default=0.0)
+    parser.add_argument("--take-slot-uniform-weight", type=float, default=0.0)
+    parser.add_argument("--take-pair-uniform-weight", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -120,8 +164,82 @@ def make_model_config(args: argparse.Namespace) -> dict:
     }
 
 
+def scheduled_scalar(step: int, total_steps: int, target: float, start: float, ramp: float) -> float:
+    if target <= 0.0:
+        return 0.0
+    progress = min(max(step / max(total_steps, 1), 0.0), 1.0)
+    if progress <= start:
+        return 0.0
+    if ramp <= 0.0:
+        return float(target)
+    return float(target) * min((progress - start) / ramp, 1.0)
+
+
+def dataloader_kwargs(args: argparse.Namespace) -> dict:
+    kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if args.num_workers > 0:
+        kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
+        kwargs["persistent_workers"] = not args.no_persistent_workers
+    return kwargs
+
+
+class TakeGroupedBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        take_indices: torch.Tensor,
+        batch_size: int,
+        samples_per_take: int,
+        rank: int,
+        world_size: int,
+        seed: int,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if samples_per_take <= 0 or batch_size % samples_per_take != 0:
+            raise ValueError("samples_per_take must be positive and divide batch_size")
+        self.batch_size = int(batch_size)
+        self.samples_per_take = int(samples_per_take)
+        self.takes_per_batch = self.batch_size // self.samples_per_take
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.batches_per_epoch = max(1, (len(take_indices) + self.batch_size * self.world_size - 1) // (self.batch_size * self.world_size))
+        self.take_to_indices: dict[int, torch.Tensor] = {}
+        for take in torch.unique(take_indices).tolist():
+            members = torch.nonzero(take_indices == int(take), as_tuple=False).flatten()
+            self.take_to_indices[int(take)] = members
+        self.take_ids = torch.tensor(sorted(self.take_to_indices), dtype=torch.long)
+
+    def __len__(self) -> int:
+        return self.batches_per_epoch
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        generator = torch.Generator().manual_seed(self.seed + self.epoch * 1009 + self.rank)
+        for _ in range(self.batches_per_epoch):
+            selected = self.take_ids[torch.randint(len(self.take_ids), (self.takes_per_batch,), generator=generator)]
+            batch: list[int] = []
+            for take in selected.tolist():
+                members = self.take_to_indices[int(take)]
+                choices = torch.randint(len(members), (self.samples_per_take,), generator=generator)
+                batch.extend(int(index) for index in members[choices].tolist())
+            yield batch
+
+
 def main() -> None:
     args = parse_args()
+    if torch.cuda.is_available() and not args.no_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
     distributed, local_rank, rank, world_size = setup_distributed(args)
     main_process = is_main_process(distributed, rank)
     torch.manual_seed(args.seed + rank)
@@ -140,16 +258,30 @@ def main() -> None:
         start_index=args.start_index,
         resize=args.resize,
     )
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=sampler is None,
-        sampler=sampler,
-        drop_last=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+    batch_sampler = None
+    sampler = None
+    if args.take_grouped_batches:
+        batch_sampler = TakeGroupedBatchSampler(
+            dataset.take_indices,
+            batch_size=args.batch_size,
+            samples_per_take=args.samples_per_take,
+            rank=rank,
+            world_size=world_size,
+            seed=args.seed,
+        )
+    elif distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    if batch_sampler is not None:
+        loader = DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs(args))
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=sampler is None,
+            sampler=sampler,
+            drop_last=False,
+            **dataloader_kwargs(args),
+        )
     device = torch.device(f"cuda:{local_rank}" if distributed else args.device)
     model_config = make_model_config(args)
     model = FACTTokenizer(**model_config).to(device)
@@ -171,7 +303,48 @@ def main() -> None:
         kl_weight=args.kl_weight,
         balance_weight=args.balance_weight,
         private_reg_weight=args.private_reg_weight,
+        action_only_weight=args.action_only_weight,
+        action_contrast_weight=args.action_contrast_weight,
+        no_private_contrast_weight=args.no_private_contrast_weight,
+        action_contrast_margin=args.action_contrast_margin,
+        action_aux_start_fraction=args.action_aux_start_fraction,
+        action_aux_ramp_fraction=args.action_aux_ramp_fraction,
+        action_consistency_weight=args.action_consistency_weight,
+        assignment_entropy_weight=args.assignment_entropy_weight,
+        assignment_entropy_target=args.assignment_entropy_target,
+        slot_balance_weight=args.slot_balance_weight,
+        hard_usage_balance_weight=args.hard_usage_balance_weight,
+        slot_diversity_weight=args.slot_diversity_weight,
+        motion_focus_weight=args.motion_focus_weight,
+        action_only_motion_focus_weight=args.action_only_motion_focus_weight,
+        motion_contrast_weight=args.motion_contrast_weight,
+        delta_focus_weight=args.delta_focus_weight,
+        action_only_delta_focus_weight=args.action_only_delta_focus_weight,
+        delta_contrast_weight=args.delta_contrast_weight,
+        motion_focus_gamma=args.motion_focus_gamma,
+        motion_focus_max_weight=args.motion_focus_max_weight,
+        exo_aux_multiplier=args.exo_aux_multiplier,
+        teacher_ego_uncertainty_weight=args.teacher_ego_uncertainty_weight,
+        teacher_disagreement_weight=args.teacher_disagreement_weight,
+        teacher_base_bias=args.teacher_base_bias,
+        same_take_contrast_weight=args.same_take_contrast_weight,
+        take_uniform_weight=args.take_uniform_weight,
+        take_slot_uniform_weight=args.take_slot_uniform_weight,
+        take_pair_uniform_weight=args.take_pair_uniform_weight,
     )
+    include_action_only = (
+        args.action_only_weight > 0.0
+        or args.no_private_contrast_weight > 0.0
+        or args.action_only_motion_focus_weight > 0.0
+        or args.action_only_delta_focus_weight > 0.0
+    )
+    include_action_shuffle = (
+        args.action_contrast_weight > 0.0
+        or args.no_private_contrast_weight > 0.0
+        or args.motion_contrast_weight > 0.0
+        or args.delta_contrast_weight > 0.0
+    )
+    include_same_take_action_shuffle = args.same_take_contrast_weight > 0.0
 
     history = []
     start_step = 0
@@ -180,7 +353,10 @@ def main() -> None:
         unwrap_model(model).load_state_dict(checkpoint["state_dict"])
         if "optimizer_state" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
-        history = list(checkpoint.get("history", []))
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr
+                group["weight_decay"] = args.weight_decay
+        history = [] if args.discard_resume_history else list(checkpoint.get("history", []))
         start_step = int(checkpoint.get("step", -1)) + 1
         if main_process:
             print(f"Resumed {args.resume_checkpoint} from step {start_step}", flush=True)
@@ -190,6 +366,8 @@ def main() -> None:
     epoch = start_step // max(1, len(loader))
     if sampler is not None:
         sampler.set_epoch(epoch)
+    if batch_sampler is not None:
+        batch_sampler.set_epoch(epoch)
     for step in range(start_step, args.steps):
         try:
             batch = next(iterator)
@@ -197,15 +375,40 @@ def main() -> None:
             epoch += 1
             if sampler is not None:
                 sampler.set_epoch(epoch)
+            if batch_sampler is not None:
+                batch_sampler.set_epoch(epoch)
             iterator = iter(loader)
             batch = next(iterator)
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(batch)
+        current_private_dropout = scheduled_scalar(
+            step,
+            args.steps,
+            args.private_dropout,
+            args.private_dropout_start_fraction,
+            args.private_dropout_ramp_fraction,
+        )
+        current_action_slot_dropout = scheduled_scalar(
+            step,
+            args.steps,
+            args.action_slot_dropout,
+            args.action_slot_dropout_start_fraction,
+            args.action_slot_dropout_ramp_fraction,
+        )
+        outputs = model(
+            batch,
+            private_dropout=current_private_dropout,
+            action_slot_dropout=current_action_slot_dropout,
+            include_action_only=include_action_only,
+            include_action_shuffle=include_action_shuffle,
+            include_same_take_action_shuffle=include_same_take_action_shuffle,
+        )
         loss, logs = compute_fact_loss(outputs, step=step, total_steps=args.steps, config=loss_config)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite FACT loss at step {step}: {loss.item()}")
         loss.backward()
         optimizer.step()
+        logs["private_dropout"] = current_private_dropout
+        logs["action_slot_dropout"] = current_action_slot_dropout
         row = {"step": step, **logs}
         if main_process:
             history.append(row)
@@ -237,7 +440,7 @@ def main() -> None:
     all_indices = []
     all_confidence = []
     with torch.inference_mode():
-        for batch in DataLoader(dataset, batch_size=args.batch_size, shuffle=False):
+        for batch in DataLoader(dataset, batch_size=args.batch_size, shuffle=False, **dataloader_kwargs(args)):
             encoded = model_to_save.encode_shared_action(batch, view_name=args.view_names[0])
             all_indices.append(encoded["indices"].cpu())
             all_confidence.append(encoded["confidence"].cpu())

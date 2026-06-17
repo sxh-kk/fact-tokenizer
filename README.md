@@ -30,6 +30,7 @@ scripts/
   launch_fact_dynamic_gpus.py
   extract_fact_tokens.py
   validate_fact_tokens.py
+  probe_fact_action_tokens.py
   visualize_fact_run.py
 ```
 
@@ -137,3 +138,38 @@ Useful metrics to monitor:
 - code usage fraction
 - ego/exo assignment KL
 - token confidence histogram
+
+Mechanism-level action-token probes:
+
+```bash
+python scripts/probe_fact_action_tokens.py \
+  --checkpoint outputs/fact_tokenizer/run_name/fact_tokenizer.ckpt \
+  --input-npz data/fact_egoexo/shards/train_diverse_500takes_16t_000000.npz \
+  --output-dir outputs/fact_tokenizer/run_name/action_token_probe \
+  --source-view-keys ego exo \
+  --resize 224 \
+  --batch-size 8 \
+  --device cuda
+```
+
+This writes:
+
+- `causality_ablation.csv/json`: correct token vs global shuffle, same-take shuffle, random-take, temporal-offset, zero, and random-code controls.
+- `private_leakage_ablation.csv/json`: action-token/private-residual 3x3 ablation plus private-dropout sweeps.
+- `semantic_probe.json`: optional label-based purity/NMI/conditional histograms, plus automatic view-invariance and take-leakage controls.
+- `probe_summary.json`: compact readout of the most important deltas.
+
+If you have take-level or interval labels, pass them directly:
+
+```bash
+python scripts/probe_fact_action_tokens.py \
+  --checkpoint outputs/fact_tokenizer/run_name/fact_tokenizer.ckpt \
+  --input-npz data/fact_egoexo/shards/train_diverse_500takes_16t_000000.npz \
+  --output-dir outputs/fact_tokenizer/run_name/action_token_probe_with_labels \
+  --labels data/egoexo4d/fact_debug/selected_takes_500_diverse.jsonl \
+  --label-columns parent_task_name task_name university_name \
+  --source-view-keys ego exo \
+  --resize 224 \
+  --batch-size 8 \
+  --device cuda
+```

@@ -73,11 +73,17 @@ def main() -> None:
     parser.add_argument("--selected-jsonl", type=Path, default=Path("data/egoexo4d/fact_debug/selected_takes.jsonl"))
     parser.add_argument("--output-npz", type=Path, default=Path("data/fact_egoexo/shards/train_debug_000000.npz"))
     parser.add_argument("--failed-jsonl", type=Path, default=Path("data/fact_egoexo/failed_samples.jsonl"))
-    parser.add_argument("--samples-per-take", type=int, default=8)
+    parser.add_argument("--samples-per-take", type=int, default=8, help="Maximum transitions sampled per take.")
     parser.add_argument("--stride-sec", type=float, default=2.0)
     parser.add_argument("--transition-sec", type=float, default=0.5)
     parser.add_argument("--resize", type=int, default=224)
     args = parser.parse_args()
+    if args.samples_per_take <= 0:
+        raise ValueError("--samples-per-take must be positive")
+    if args.stride_sec <= 0.0:
+        raise ValueError("--stride-sec must be positive")
+    if args.transition_sec <= 0.0:
+        raise ValueError("--transition-sec must be positive")
 
     rows = load_jsonl(args.selected_jsonl)
     ego_clips = []
@@ -97,8 +103,10 @@ def main() -> None:
         start = float(row.get("task_start_sec") or 0.0)
         end = float(row.get("task_end_sec") or row.get("duration_sec") or start)
         max_start = max(start, end - args.transition_sec)
-        for index in range(args.samples_per_take):
-            timestamp = min(start + index * args.stride_sec, max_start)
+        available = int(np.floor((max_start - start) / args.stride_sec)) + 1
+        num_samples = min(args.samples_per_take, max(1, available))
+        for index in range(num_samples):
+            timestamp = start + index * args.stride_sec
             ego = read_frame_pair(ego_path, timestamp, args.transition_sec, args.resize)
             exo = read_frame_pair(exo_path, timestamp, args.transition_sec, args.resize)
             if ego is None or exo is None:

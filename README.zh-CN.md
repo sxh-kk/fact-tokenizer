@@ -31,6 +31,7 @@ scripts/
   launch_fact_dynamic_gpus.py
   extract_fact_tokens.py
   validate_fact_tokens.py
+  probe_fact_action_tokens.py
   visualize_fact_run.py
 ```
 
@@ -193,3 +194,38 @@ python scripts/validate_fact_tokens.py \
 - token confidence histogram
 
 第一阶段目标是让 token 机制跑通：能训练、能保存、能恢复、能导出、能做基本验证。第一版不要求 token 已经有很强语义纯度。
+
+三类 action-token 机制验证：
+
+```bash
+python scripts/probe_fact_action_tokens.py \
+  --checkpoint outputs/fact_tokenizer/run_name/fact_tokenizer.ckpt \
+  --input-npz data/fact_egoexo/shards/train_diverse_500takes_16t_000000.npz \
+  --output-dir outputs/fact_tokenizer/run_name/action_token_probe \
+  --source-view-keys ego exo \
+  --resize 224 \
+  --batch-size 8 \
+  --device cuda
+```
+
+输出文件：
+
+- `causality_ablation.csv/json`：比较 correct token、global shuffle、same-take shuffle、random-take、temporal-offset、zero、random-code 控制组。
+- `private_leakage_ablation.csv/json`：action token / private residual 的 3x3 ablation，以及 private dropout sweep。
+- `semantic_probe.json`：可选标签的 purity、NMI、conditional histogram，同时自动报告 view-invariance 和 take-leakage 控制项。
+- `probe_summary.json`：最重要差值的浓缩摘要，适合直接读实验结论。
+
+如果有 take 级或 interval 级标签，可以直接接入：
+
+```bash
+python scripts/probe_fact_action_tokens.py \
+  --checkpoint outputs/fact_tokenizer/run_name/fact_tokenizer.ckpt \
+  --input-npz data/fact_egoexo/shards/train_diverse_500takes_16t_000000.npz \
+  --output-dir outputs/fact_tokenizer/run_name/action_token_probe_with_labels \
+  --labels data/egoexo4d/fact_debug/selected_takes_500_diverse.jsonl \
+  --label-columns parent_task_name task_name university_name \
+  --source-view-keys ego exo \
+  --resize 224 \
+  --batch-size 8 \
+  --device cuda
+```

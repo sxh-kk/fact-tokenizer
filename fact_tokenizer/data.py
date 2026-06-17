@@ -101,6 +101,7 @@ class FACTPairedNPZDataset(Dataset):
 
         with np.load(self.input_npz, allow_pickle=False) as data:
             arrays = self._load_arrays(data, source_view_keys, videos_layout)
+            take_uid = np.asarray(data["take_uid"]).astype(str) if "take_uid" in data else None
 
         if len(arrays) < 2:
             raise ValueError("FACTPairedNPZDataset needs two synchronized views")
@@ -120,6 +121,16 @@ class FACTPairedNPZDataset(Dataset):
         self.source_view_keys = list(arrays.keys())[:2]
         self.frame_pair = frame_pair
         self.resize = resize
+        num_samples = len(self)
+        if take_uid is not None:
+            if len(take_uid) != num_samples:
+                raise ValueError(f"take_uid has length {len(take_uid)}, expected {num_samples}")
+            unique_takes = {uid: idx for idx, uid in enumerate(sorted(set(take_uid.tolist())))}
+            self.take_uids = take_uid.tolist()
+            self.take_indices = torch.tensor([unique_takes[uid] for uid in self.take_uids], dtype=torch.long)
+        else:
+            self.take_uids = [str(index) for index in range(num_samples)]
+            self.take_indices = torch.arange(num_samples, dtype=torch.long)
 
     def _load_arrays(
         self,
@@ -154,6 +165,7 @@ class FACTPairedNPZDataset(Dataset):
             view_name: {
                 "videos": self.videos[view_name][index],
                 "sample_id": torch.tensor(index, dtype=torch.long),
+                "take_index": self.take_indices[index],
             }
             for view_name in self.output_view_names
         }
