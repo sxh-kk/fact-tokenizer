@@ -115,6 +115,20 @@ def save_npz_split(
     np.savez_compressed(output_path, **payload)
 
 
+def sample_count_summary(take_uid: np.ndarray, mask: np.ndarray) -> dict[str, Any]:
+    counts = Counter(take_uid[mask].tolist())
+    if not counts:
+        return {"takes": 0, "samples": 0}
+    values = list(counts.values())
+    return {
+        "takes": len(counts),
+        "samples": int(sum(values)),
+        "min_samples_per_take": int(min(values)),
+        "max_samples_per_take": int(max(values)),
+        "sample_count_histogram": dict(sorted(Counter(values).items())),
+    }
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,6 +163,8 @@ def main() -> None:
         "num_samples": int(len(take_uid)),
         "num_train_samples": int(train_mask.sum()),
         "num_heldout_samples": int(heldout_mask.sum()),
+        "train_sample_count_summary": sample_count_summary(take_uid, train_mask),
+        "heldout_sample_count_summary": sample_count_summary(take_uid, heldout_mask),
     }
 
     if args.labels_jsonl:
