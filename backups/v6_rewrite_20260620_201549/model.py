@@ -105,38 +105,6 @@ class SpatialDecoder(nn.Module):
         return x[:, :, -num_patch_tokens:]
 
 
-class CurrentContextBottleneck(nn.Module):
-    """Compress dense current-frame patch tokens into a small context set."""
-
-    def __init__(self, model_dim: int, num_context_tokens: int, num_heads: int, dropout: float) -> None:
-        super().__init__()
-        if num_context_tokens <= 0:
-            raise ValueError("num_context_tokens must be positive")
-        self.query = nn.Parameter(torch.empty(1, 1, num_context_tokens, model_dim))
-        nn.init.normal_(self.query, std=0.02)
-        self.query_norm = nn.LayerNorm(model_dim)
-        self.context_norm = nn.LayerNorm(model_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=model_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.out_norm = nn.LayerNorm(model_dim)
-
-    def forward(self, current_tokens: torch.Tensor) -> torch.Tensor:
-        batch, time, patches, dim = current_tokens.shape
-        query = self.query.expand(batch, time, -1, -1).reshape(batch * time, -1, dim)
-        context = current_tokens.reshape(batch * time, patches, dim)
-        pooled, _ = self.attn(
-            self.query_norm(query),
-            self.context_norm(context),
-            self.context_norm(context),
-            need_weights=False,
-        )
-        return self.out_norm(pooled).reshape(batch, time, pooled.shape[1], dim)
-
-
 class MockPatchFeatureExtractor(nn.Module):
     """Fast deterministic patch feature extractor for CPU smoke tests."""
 
@@ -296,8 +264,6 @@ class FACTTokenizer(nn.Module):
         view_names: Tuple[str, str] = ("ego", "exo"),
         max_time: int = 8,
         max_tokens: int = 1024,
-        current_context_tokens: int = 0,
-        current_context_mode: str = "full",
     ) -> None:
         super().__init__()
         self.view_names = tuple(view_names)
@@ -306,11 +272,7 @@ class FACTTokenizer(nn.Module):
         self.latent_dim = latent_dim
         self.private_dim = private_dim
         self.num_latents = num_latents
-        self.current_context_tokens = int(current_context_tokens)
-        self.current_context_mode = current_context_mode
         self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
-        if current_context_mode not in {"full", "bottleneck", "drop"}:
-            raise ValueError("current_context_mode must be one of: full, bottleneck, drop")
 
         if backbone == "mock":
             self.feature_extractor = MockPatchFeatureExtractor(image_channels, dino_dim, patch_size)
@@ -339,23 +301,6 @@ class FACTTokenizer(nn.Module):
         self.patch_up = nn.Linear(dino_dim, model_dim)
         self.action_up = nn.Linear(latent_dim, model_dim)
         self.private_up = nn.Linear(private_dim, model_dim)
-        self.future_query = (
-            nn.Parameter(torch.empty(1, 1, max_tokens, model_dim))
-            if current_context_mode in {"bottleneck", "drop"}
-            else None
-        )
-        if self.future_query is not None:
-            nn.init.normal_(self.future_query, std=0.02)
-        self.current_bottleneck = (
-            CurrentContextBottleneck(
-                model_dim=model_dim,
-                num_context_tokens=self.current_context_tokens,
-                num_heads=num_heads,
-                dropout=dropout,
-            )
-            if current_context_mode == "bottleneck"
-            else None
-        )
         self.decoder = SpatialDecoder(
             model_dim=model_dim,
             out_dim=dino_dim,
@@ -398,15 +343,7 @@ class FACTTokenizer(nn.Module):
         zero_action: bool = False,
         action_slot_dropout: float = 0.0,
     ) -> torch.Tensor:
-        raw_current_tokens = self.patch_up(obs_view["current_patches"])
-        output_patch_tokens = raw_current_tokens.shape[2]
-        current_tokens = raw_current_tokens
-        if self.current_context_mode == "drop":
-            current_tokens = current_tokens[:, :, :0]
-        elif self.current_context_mode == "bottleneck":
-            if self.current_bottleneck is None:
-                raise RuntimeError("current_context_mode='bottleneck' requires current_bottleneck")
-            current_tokens = self.current_bottleneck(current_tokens)
+        current_tokens = self.patch_up(obs_view["current_patches"])
         action = act_view["z_q"]
         if zero_action:
             action = torch.zeros_like(action)
@@ -434,17 +371,8 @@ class FACTTokenizer(nn.Module):
                 mask = torch.rand((*private.shape[:-1], 1), device=private.device, dtype=private.dtype) < keep_prob
                 private = private * mask
         private_tokens = self.private_up(private)
-        if self.future_query is not None:
-            if output_patch_tokens > self.future_query.shape[2]:
-                raise ValueError(
-                    f"Future query table too small for {output_patch_tokens} patches; "
-                    f"configured {self.future_query.shape[2]}"
-                )
-            batch, time = raw_current_tokens.shape[:2]
-            query_tokens = self.future_query[:, :, :output_patch_tokens].expand(batch, time, -1, -1)
-            current_tokens = torch.cat([current_tokens, query_tokens], dim=2)
         decoder_input = torch.cat([action_tokens, private_tokens, current_tokens], dim=2)
-        return self.decoder(decoder_input, num_patch_tokens=output_patch_tokens)
+        return self.decoder(decoder_input, num_patch_tokens=current_tokens.shape[2])
 
     def _make_shuffled_action_view(
         self,
@@ -877,6 +805,4 @@ class FACTTokenizer(nn.Module):
             "num_action_slots": self.num_action_slots,
             "num_private_slots": self.num_private_slots,
             "view_names": self.view_names,
-            "current_context_tokens": self.current_context_tokens,
-            "current_context_mode": self.current_context_mode,
         }

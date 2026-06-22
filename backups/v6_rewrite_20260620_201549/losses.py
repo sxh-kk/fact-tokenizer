@@ -36,8 +36,6 @@ class FACTLossConfig:
     assignment_entropy_target: float = 0.0
     slot_balance_weight: float = 0.0
     hard_usage_balance_weight: float = 0.0
-    hard_usage_entropy_weight: float = 0.0
-    hard_usage_entropy_target_fraction: float = 0.75
     usage_capacity_weight: float = 0.0
     usage_capacity_max_fraction: float = 0.07
     slot_diversity_weight: float = 0.0
@@ -47,10 +45,6 @@ class FACTLossConfig:
     delta_focus_weight: float = 0.0
     action_only_delta_focus_weight: float = 0.0
     delta_contrast_weight: float = 0.0
-    no_private_delta_contrast_weight: float = 0.0
-    delta_direction_magnitude_weight: float = 0.25
-    motion_gated_usage_weight: float = 0.0
-    motion_gated_usage_gamma: float = 2.0
     motion_focus_gamma: float = 2.0
     motion_focus_max_weight: float = 6.0
     exo_aux_multiplier: float = 1.0
@@ -230,34 +224,6 @@ def hard_code_usage_balance_loss(views: Dict[str, dict]) -> torch.Tensor:
     return F.kl_div(avg_probs.clamp_min(1e-8).log(), uniform, reduction="sum")
 
 
-def hard_usage_entropy_loss(views: Dict[str, dict], target_fraction: float = 0.75) -> torch.Tensor:
-    """Encourage hard assignments to keep enough codes active.
-
-    Soft assignment balancing can look healthy even when argmax codes collapse.
-    This term maximizes entropy of straight-through hard assignment histograms,
-    both globally per view and separately per action slot.
-    """
-    penalties = []
-    for view in views.values():
-        assignments = _straight_through_one_hot(view)
-        num_codes = assignments.shape[-1]
-        target_codes = max(1.0, min(float(target_fraction), 1.0) * float(num_codes))
-        target_entropy = torch.log(torch.tensor(target_codes, device=assignments.device, dtype=assignments.dtype))
-        max_entropy = torch.log(torch.tensor(float(num_codes), device=assignments.device, dtype=assignments.dtype))
-
-        flat_probs = assignments.reshape(-1, num_codes).mean(dim=0).clamp_min(1e-8)
-        flat_entropy = -(flat_probs * flat_probs.log()).sum()
-        penalties.append(F.relu(target_entropy - flat_entropy).pow(2) / max_entropy.clamp_min(1e-8))
-
-        slot_probs = assignments.mean(dim=0).clamp_min(1e-8)
-        slot_entropy = -(slot_probs * slot_probs.log()).sum(dim=-1)
-        penalties.append(F.relu(target_entropy - slot_entropy).pow(2).mean() / max_entropy.clamp_min(1e-8))
-    if not penalties:
-        reference = next(iter(views.values()))["soft_probs"]
-        return reference.new_zeros(())
-    return torch.stack(penalties).mean()
-
-
 def code_usage_capacity_loss(views: Dict[str, dict], max_fraction: float) -> torch.Tensor:
     assignments = torch.cat(
         [_straight_through_one_hot(view).reshape(-1, view["soft_probs"].shape[-1]) for view in views.values()],
@@ -391,76 +357,19 @@ def motion_focused_reconstruction_losses(outputs: dict, gamma: float, max_weight
     return losses
 
 
-def _motion_score_from_path(path: dict) -> torch.Tensor | None:
-    current = path.get("current")
-    if current is None:
-        return None
-    return (path["target"] - current).pow(2).reshape(path["target"].shape[0], -1).mean(dim=1)
-
-
-def _per_sample_delta_square(path: dict, magnitude_weight: float = 0.25) -> torch.Tensor:
-    """Motion-relative transition loss.
-
-    A plain MSE on (recon-current)-(target-current) is algebraically identical
-    to future-feature MSE. This loss instead compares transition direction and
-    relative magnitude, with high-motion patches carrying more weight.
-    """
+def _per_sample_delta_square(path: dict) -> torch.Tensor:
     current = path.get("current")
     if current is None:
         return _per_sample_mean_square((path["recon"] - path["target"]) ** 2)
-    eps = 1e-6
-    recon_delta = path["recon"] - current
-    target_delta = path["target"] - current
-    target_norm = target_delta.norm(dim=-1).clamp_min(eps)
-    recon_norm = recon_delta.norm(dim=-1).clamp_min(eps)
-    cosine_loss = 1.0 - F.cosine_similarity(recon_delta, target_delta, dim=-1, eps=eps)
-    motion_weight = target_norm.detach()
-    motion_weight = motion_weight / motion_weight.reshape(motion_weight.shape[0], -1).mean(dim=1).reshape(
-        -1,
-        *([1] * (motion_weight.ndim - 1)),
-    ).clamp_min(eps)
-    magnitude_loss = ((recon_norm - target_norm) / target_norm.detach().clamp_min(0.05)).pow(2)
-    loss = cosine_loss.clamp(0.0, 2.0) + float(magnitude_weight) * magnitude_loss
-    return (loss * motion_weight).reshape(loss.shape[0], -1).mean(dim=1)
+    delta_error = (path["recon"] - current) - (path["target"] - current)
+    return _per_sample_mean_square(delta_error ** 2)
 
 
 def delta_reconstruction_losses(outputs: dict) -> Dict[str, torch.Tensor]:
     losses = {}
     for name, path in outputs["reconstructions"].items():
-        losses[name] = _per_sample_delta_square(
-            path,
-            magnitude_weight=outputs.get("delta_direction_magnitude_weight", 0.25),
-        ).mean()
+        losses[name] = _per_sample_delta_square(path).mean()
     return losses
-
-
-def motion_gated_hard_usage_balance_loss(outputs: dict, gamma: float = 2.0) -> torch.Tensor:
-    views = outputs["views"]
-    base_paths = [
-        outputs["reconstructions"][name]
-        for name in ("ego_self", "exo_self")
-        if name in outputs["reconstructions"]
-    ]
-    scores = [_motion_score_from_path(path) for path in base_paths]
-    scores = [score for score in scores if score is not None]
-    if not scores:
-        reference = next(iter(views.values()))["soft_probs"]
-        return reference.new_zeros(())
-    motion = torch.stack(scores).mean(dim=0)
-    motion = motion / motion.mean().clamp_min(1e-8)
-    base_sample_weight = (1.0 + float(gamma) * motion).detach()
-    base_sample_weight = base_sample_weight / base_sample_weight.mean().clamp_min(1e-8)
-    weighted_assignments = []
-    for view in views.values():
-        assignments = _straight_through_one_hot(view)
-        sample_weight = base_sample_weight
-        while sample_weight.ndim < assignments.ndim:
-            sample_weight = sample_weight.unsqueeze(-1)
-        weighted_assignments.append((assignments * sample_weight).reshape(-1, assignments.shape[-1]))
-    avg_probs = torch.cat(weighted_assignments, dim=0).mean(dim=0)
-    avg_probs = avg_probs / avg_probs.sum().clamp_min(1e-8)
-    uniform = torch.full_like(avg_probs, 1.0 / avg_probs.numel())
-    return F.kl_div(avg_probs.clamp_min(1e-8).log(), uniform, reduction="sum")
 
 
 def action_contrast_loss(
@@ -520,7 +429,6 @@ def compute_fact_loss(
         raise ValueError(f"FACT v0.1 loss expects two views, got {view_names}")
     ego_view = views[view_names[0]]
     exo_view = views[view_names[1]]
-    outputs["delta_direction_magnitude_weight"] = config.delta_direction_magnitude_weight
 
     self_loss = recon["ego_self"] + recon["exo_self"]
     swap_loss = recon["ego_swap"] + recon["exo_swap"]
@@ -537,12 +445,7 @@ def compute_fact_loss(
     entropy_mean = assignment_entropy_mean(views)
     slot_balance_loss = slot_code_usage_balance_loss(views)
     hard_balance_loss = hard_code_usage_balance_loss(views)
-    hard_entropy_loss = hard_usage_entropy_loss(views, config.hard_usage_entropy_target_fraction)
     capacity_loss = code_usage_capacity_loss(views, config.usage_capacity_max_fraction)
-    motion_gated_usage_loss = motion_gated_hard_usage_balance_loss(
-        outputs,
-        gamma=config.motion_gated_usage_gamma,
-    )
     slot_div_loss = slot_diversity_loss(views)
     take_uniform_loss = take_uniformity_loss(views, outputs.get("take_index"))
     take_slot_uniform_loss = take_slot_uniformity_loss(views, outputs.get("take_index"))
@@ -649,14 +552,6 @@ def compute_fact_loss(
     delta_contrast_loss = action_contrast_loss(
         outputs,
         positive_names=base_names,
-        suffix="_action_shuffle",
-        margin=config.action_contrast_margin,
-        exo_aux_multiplier=config.exo_aux_multiplier,
-        delta_focused=True,
-    )
-    no_private_delta_contrast_loss = action_contrast_loss(
-        outputs,
-        positive_names=no_private_names,
         suffix="_action_shuffle",
         margin=config.action_contrast_margin,
         exo_aux_multiplier=config.exo_aux_multiplier,
@@ -784,13 +679,6 @@ def compute_fact_loss(
         config.action_aux_start_fraction,
         config.action_aux_ramp_fraction,
     )
-    hard_entropy_weight = scheduled_aux_weight(
-        step,
-        total_steps,
-        config.hard_usage_entropy_weight,
-        config.action_aux_start_fraction,
-        config.action_aux_ramp_fraction,
-    )
     capacity_weight = scheduled_aux_weight(
         step,
         total_steps,
@@ -844,13 +732,6 @@ def compute_fact_loss(
         step,
         total_steps,
         config.delta_contrast_weight,
-        config.action_aux_start_fraction,
-        config.action_aux_ramp_fraction,
-    )
-    no_private_delta_contrast_weight = scheduled_aux_weight(
-        step,
-        total_steps,
-        config.no_private_delta_contrast_weight,
         config.action_aux_start_fraction,
         config.action_aux_ramp_fraction,
     )
@@ -917,13 +798,6 @@ def compute_fact_loss(
         config.action_aux_start_fraction,
         config.action_aux_ramp_fraction,
     )
-    motion_gated_usage_weight = scheduled_aux_weight(
-        step,
-        total_steps,
-        config.motion_gated_usage_weight,
-        config.action_aux_start_fraction,
-        config.action_aux_ramp_fraction,
-    )
 
     loss = (
         weights["self"] * self_loss
@@ -939,7 +813,6 @@ def compute_fact_loss(
         + entropy_weight * entropy_loss
         + slot_balance_weight * slot_balance_loss
         + hard_balance_weight * hard_balance_loss
-        + hard_entropy_weight * hard_entropy_loss
         + capacity_weight * capacity_loss
         + slot_diversity_weight * slot_div_loss
         + motion_focus_weight * motion_focus_loss
@@ -948,7 +821,6 @@ def compute_fact_loss(
         + delta_focus_weight * delta_focus_loss
         + action_only_delta_focus_weight * action_only_delta_focus_loss
         + delta_contrast_weight * delta_contrast_loss
-        + no_private_delta_contrast_weight * no_private_delta_contrast_loss
         + same_take_contrast_weight * same_take_contrast_loss
         + no_private_same_take_contrast_weight * no_private_same_take_contrast_loss
         + temporal_offset_contrast_weight * temporal_offset_contrast_loss
@@ -958,7 +830,6 @@ def compute_fact_loss(
         + take_uniform_weight * take_uniform_loss
         + take_slot_uniform_weight * take_slot_uniform_loss
         + take_pair_uniform_weight * take_pair_uniform_loss
-        + motion_gated_usage_weight * motion_gated_usage_loss
         + vq_loss
         + weights["kl"] * config.kl_weight * kl_loss
         + config.balance_weight * balance_loss
@@ -974,9 +845,7 @@ def compute_fact_loss(
         "balance_loss": float(balance_loss.detach().cpu()),
         "slot_balance_loss": float(slot_balance_loss.detach().cpu()),
         "hard_usage_balance_loss": float(hard_balance_loss.detach().cpu()),
-        "hard_usage_entropy_loss": float(hard_entropy_loss.detach().cpu()),
         "usage_capacity_loss": float(capacity_loss.detach().cpu()),
-        "motion_gated_usage_loss": float(motion_gated_usage_loss.detach().cpu()),
         "slot_diversity_loss": float(slot_div_loss.detach().cpu()),
         "take_uniformity_loss": float(take_uniform_loss.detach().cpu()),
         "take_slot_uniformity_loss": float(take_slot_uniform_loss.detach().cpu()),
@@ -1001,7 +870,6 @@ def compute_fact_loss(
         "delta_focus_loss": float(delta_focus_loss.detach().cpu()),
         "action_only_delta_focus_loss": float(action_only_delta_focus_loss.detach().cpu()),
         "delta_contrast_loss": float(delta_contrast_loss.detach().cpu()),
-        "no_private_delta_contrast_loss": float(no_private_delta_contrast_loss.detach().cpu()),
         "same_take_contrast_loss": float(same_take_contrast_loss.detach().cpu()),
         "no_private_same_take_contrast_loss": float(no_private_same_take_contrast_loss.detach().cpu()),
         "temporal_offset_contrast_loss": float(temporal_offset_contrast_loss.detach().cpu()),
@@ -1022,7 +890,6 @@ def compute_fact_loss(
         "weight_assignment_entropy": entropy_weight,
         "weight_slot_balance": slot_balance_weight,
         "weight_hard_usage_balance": hard_balance_weight,
-        "weight_hard_usage_entropy": hard_entropy_weight,
         "weight_usage_capacity": capacity_weight,
         "weight_slot_diversity": slot_diversity_weight,
         "weight_motion_focus": motion_focus_weight,
@@ -1031,8 +898,6 @@ def compute_fact_loss(
         "weight_delta_focus": delta_focus_weight,
         "weight_action_only_delta_focus": action_only_delta_focus_weight,
         "weight_delta_contrast": delta_contrast_weight,
-        "weight_no_private_delta_contrast": no_private_delta_contrast_weight,
-        "weight_motion_gated_usage": motion_gated_usage_weight,
         "weight_same_take_contrast": same_take_contrast_weight,
         "weight_no_private_same_take_contrast": no_private_same_take_contrast_weight,
         "weight_temporal_offset_contrast": temporal_offset_contrast_weight,

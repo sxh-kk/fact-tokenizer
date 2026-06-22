@@ -71,8 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--vq-temperature", type=float, default=0.1)
-    parser.add_argument("--current-context-mode", choices=["full", "bottleneck", "drop"], default="full")
-    parser.add_argument("--current-context-tokens", type=int, default=0)
     parser.add_argument("--vq-beta", type=float, default=0.25)
     parser.add_argument("--kl-weight", type=float, default=0.1)
     parser.add_argument("--balance-weight", type=float, default=0.01)
@@ -105,8 +103,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assignment-entropy-target", type=float, default=0.0)
     parser.add_argument("--slot-balance-weight", type=float, default=0.0)
     parser.add_argument("--hard-usage-balance-weight", type=float, default=0.0)
-    parser.add_argument("--hard-usage-entropy-weight", type=float, default=0.0)
-    parser.add_argument("--hard-usage-entropy-target-fraction", type=float, default=0.75)
     parser.add_argument("--usage-capacity-weight", type=float, default=0.0)
     parser.add_argument("--usage-capacity-max-fraction", type=float, default=0.07)
     parser.add_argument("--slot-diversity-weight", type=float, default=0.0)
@@ -116,10 +112,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-focus-weight", type=float, default=0.0)
     parser.add_argument("--action-only-delta-focus-weight", type=float, default=0.0)
     parser.add_argument("--delta-contrast-weight", type=float, default=0.0)
-    parser.add_argument("--no-private-delta-contrast-weight", type=float, default=0.0)
-    parser.add_argument("--delta-direction-magnitude-weight", type=float, default=0.25)
-    parser.add_argument("--motion-gated-usage-weight", type=float, default=0.0)
-    parser.add_argument("--motion-gated-usage-gamma", type=float, default=2.0)
     parser.add_argument("--motion-focus-gamma", type=float, default=2.0)
     parser.add_argument("--motion-focus-max-weight", type=float, default=6.0)
     parser.add_argument("--exo-aux-multiplier", type=float, default=1.0)
@@ -184,8 +176,6 @@ def make_model_config(args: argparse.Namespace) -> dict:
         "view_names": tuple(args.view_names),
         "max_time": 8,
         "max_tokens": 1024,
-        "current_context_mode": args.current_context_mode,
-        "current_context_tokens": args.current_context_tokens,
     }
 
 
@@ -349,8 +339,6 @@ def main() -> None:
         assignment_entropy_target=args.assignment_entropy_target,
         slot_balance_weight=args.slot_balance_weight,
         hard_usage_balance_weight=args.hard_usage_balance_weight,
-        hard_usage_entropy_weight=args.hard_usage_entropy_weight,
-        hard_usage_entropy_target_fraction=args.hard_usage_entropy_target_fraction,
         usage_capacity_weight=args.usage_capacity_weight,
         usage_capacity_max_fraction=args.usage_capacity_max_fraction,
         slot_diversity_weight=args.slot_diversity_weight,
@@ -360,10 +348,6 @@ def main() -> None:
         delta_focus_weight=args.delta_focus_weight,
         action_only_delta_focus_weight=args.action_only_delta_focus_weight,
         delta_contrast_weight=args.delta_contrast_weight,
-        no_private_delta_contrast_weight=args.no_private_delta_contrast_weight,
-        delta_direction_magnitude_weight=args.delta_direction_magnitude_weight,
-        motion_gated_usage_weight=args.motion_gated_usage_weight,
-        motion_gated_usage_gamma=args.motion_gated_usage_gamma,
         motion_focus_gamma=args.motion_focus_gamma,
         motion_focus_max_weight=args.motion_focus_max_weight,
         exo_aux_multiplier=args.exo_aux_multiplier,
@@ -383,7 +367,6 @@ def main() -> None:
         or args.no_private_same_take_contrast_weight > 0.0
         or args.no_private_temporal_offset_contrast_weight > 0.0
         or args.no_private_action_aware_contrast_weight > 0.0
-        or args.no_private_delta_contrast_weight > 0.0
         or args.action_only_motion_focus_weight > 0.0
         or args.action_only_delta_focus_weight > 0.0
     )
@@ -392,7 +375,6 @@ def main() -> None:
         or args.no_private_contrast_weight > 0.0
         or args.motion_contrast_weight > 0.0
         or args.delta_contrast_weight > 0.0
-        or args.no_private_delta_contrast_weight > 0.0
     )
     include_random_code_action = (
         args.random_code_contrast_weight > 0.0
@@ -413,24 +395,12 @@ def main() -> None:
     start_step = 0
     if args.resume_checkpoint is not None:
         checkpoint = torch.load(args.resume_checkpoint, map_location=device)
-        incompatible = unwrap_model(model).load_state_dict(checkpoint["state_dict"], strict=False)
-        if main_process and (incompatible.missing_keys or incompatible.unexpected_keys):
-            print(
-                "Checkpoint loaded with non-strict state dict. "
-                f"missing_keys={incompatible.missing_keys} "
-                f"unexpected_keys={incompatible.unexpected_keys}",
-                flush=True,
-            )
+        unwrap_model(model).load_state_dict(checkpoint["state_dict"])
         if "optimizer_state" in checkpoint:
-            try:
-                optimizer.load_state_dict(checkpoint["optimizer_state"])
-            except ValueError as exc:
-                if main_process:
-                    print(f"Skipped optimizer state from checkpoint: {exc}", flush=True)
-            else:
-                for group in optimizer.param_groups:
-                    group["lr"] = args.lr
-                    group["weight_decay"] = args.weight_decay
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr
+                group["weight_decay"] = args.weight_decay
         history = [] if args.discard_resume_history else list(checkpoint.get("history", []))
         start_step = int(checkpoint.get("step", -1)) + 1
         if main_process:

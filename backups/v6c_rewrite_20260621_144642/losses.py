@@ -36,8 +36,6 @@ class FACTLossConfig:
     assignment_entropy_target: float = 0.0
     slot_balance_weight: float = 0.0
     hard_usage_balance_weight: float = 0.0
-    hard_usage_entropy_weight: float = 0.0
-    hard_usage_entropy_target_fraction: float = 0.75
     usage_capacity_weight: float = 0.0
     usage_capacity_max_fraction: float = 0.07
     slot_diversity_weight: float = 0.0
@@ -228,34 +226,6 @@ def hard_code_usage_balance_loss(views: Dict[str, dict]) -> torch.Tensor:
     avg_probs = assignments.mean(dim=0)
     uniform = torch.full_like(avg_probs, 1.0 / avg_probs.numel())
     return F.kl_div(avg_probs.clamp_min(1e-8).log(), uniform, reduction="sum")
-
-
-def hard_usage_entropy_loss(views: Dict[str, dict], target_fraction: float = 0.75) -> torch.Tensor:
-    """Encourage hard assignments to keep enough codes active.
-
-    Soft assignment balancing can look healthy even when argmax codes collapse.
-    This term maximizes entropy of straight-through hard assignment histograms,
-    both globally per view and separately per action slot.
-    """
-    penalties = []
-    for view in views.values():
-        assignments = _straight_through_one_hot(view)
-        num_codes = assignments.shape[-1]
-        target_codes = max(1.0, min(float(target_fraction), 1.0) * float(num_codes))
-        target_entropy = torch.log(torch.tensor(target_codes, device=assignments.device, dtype=assignments.dtype))
-        max_entropy = torch.log(torch.tensor(float(num_codes), device=assignments.device, dtype=assignments.dtype))
-
-        flat_probs = assignments.reshape(-1, num_codes).mean(dim=0).clamp_min(1e-8)
-        flat_entropy = -(flat_probs * flat_probs.log()).sum()
-        penalties.append(F.relu(target_entropy - flat_entropy).pow(2) / max_entropy.clamp_min(1e-8))
-
-        slot_probs = assignments.mean(dim=0).clamp_min(1e-8)
-        slot_entropy = -(slot_probs * slot_probs.log()).sum(dim=-1)
-        penalties.append(F.relu(target_entropy - slot_entropy).pow(2).mean() / max_entropy.clamp_min(1e-8))
-    if not penalties:
-        reference = next(iter(views.values()))["soft_probs"]
-        return reference.new_zeros(())
-    return torch.stack(penalties).mean()
 
 
 def code_usage_capacity_loss(views: Dict[str, dict], max_fraction: float) -> torch.Tensor:
@@ -537,7 +507,6 @@ def compute_fact_loss(
     entropy_mean = assignment_entropy_mean(views)
     slot_balance_loss = slot_code_usage_balance_loss(views)
     hard_balance_loss = hard_code_usage_balance_loss(views)
-    hard_entropy_loss = hard_usage_entropy_loss(views, config.hard_usage_entropy_target_fraction)
     capacity_loss = code_usage_capacity_loss(views, config.usage_capacity_max_fraction)
     motion_gated_usage_loss = motion_gated_hard_usage_balance_loss(
         outputs,
@@ -784,13 +753,6 @@ def compute_fact_loss(
         config.action_aux_start_fraction,
         config.action_aux_ramp_fraction,
     )
-    hard_entropy_weight = scheduled_aux_weight(
-        step,
-        total_steps,
-        config.hard_usage_entropy_weight,
-        config.action_aux_start_fraction,
-        config.action_aux_ramp_fraction,
-    )
     capacity_weight = scheduled_aux_weight(
         step,
         total_steps,
@@ -939,7 +901,6 @@ def compute_fact_loss(
         + entropy_weight * entropy_loss
         + slot_balance_weight * slot_balance_loss
         + hard_balance_weight * hard_balance_loss
-        + hard_entropy_weight * hard_entropy_loss
         + capacity_weight * capacity_loss
         + slot_diversity_weight * slot_div_loss
         + motion_focus_weight * motion_focus_loss
@@ -974,7 +935,6 @@ def compute_fact_loss(
         "balance_loss": float(balance_loss.detach().cpu()),
         "slot_balance_loss": float(slot_balance_loss.detach().cpu()),
         "hard_usage_balance_loss": float(hard_balance_loss.detach().cpu()),
-        "hard_usage_entropy_loss": float(hard_entropy_loss.detach().cpu()),
         "usage_capacity_loss": float(capacity_loss.detach().cpu()),
         "motion_gated_usage_loss": float(motion_gated_usage_loss.detach().cpu()),
         "slot_diversity_loss": float(slot_div_loss.detach().cpu()),
@@ -1022,7 +982,6 @@ def compute_fact_loss(
         "weight_assignment_entropy": entropy_weight,
         "weight_slot_balance": slot_balance_weight,
         "weight_hard_usage_balance": hard_balance_weight,
-        "weight_hard_usage_entropy": hard_entropy_weight,
         "weight_usage_capacity": capacity_weight,
         "weight_slot_diversity": slot_diversity_weight,
         "weight_motion_focus": motion_focus_weight,

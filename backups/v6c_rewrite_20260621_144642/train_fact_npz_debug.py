@@ -105,8 +105,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assignment-entropy-target", type=float, default=0.0)
     parser.add_argument("--slot-balance-weight", type=float, default=0.0)
     parser.add_argument("--hard-usage-balance-weight", type=float, default=0.0)
-    parser.add_argument("--hard-usage-entropy-weight", type=float, default=0.0)
-    parser.add_argument("--hard-usage-entropy-target-fraction", type=float, default=0.75)
     parser.add_argument("--usage-capacity-weight", type=float, default=0.0)
     parser.add_argument("--usage-capacity-max-fraction", type=float, default=0.07)
     parser.add_argument("--slot-diversity-weight", type=float, default=0.0)
@@ -349,8 +347,6 @@ def main() -> None:
         assignment_entropy_target=args.assignment_entropy_target,
         slot_balance_weight=args.slot_balance_weight,
         hard_usage_balance_weight=args.hard_usage_balance_weight,
-        hard_usage_entropy_weight=args.hard_usage_entropy_weight,
-        hard_usage_entropy_target_fraction=args.hard_usage_entropy_target_fraction,
         usage_capacity_weight=args.usage_capacity_weight,
         usage_capacity_max_fraction=args.usage_capacity_max_fraction,
         slot_diversity_weight=args.slot_diversity_weight,
