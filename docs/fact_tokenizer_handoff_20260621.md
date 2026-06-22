@@ -60,7 +60,188 @@ data/fact_egoexo/shards/train_diverse_500takes_t1p0_s1_48t_000000.npz
 data/fact_egoexo/splits/diverse_500takes_t1p0_s1_48t_seed123_80_20/
 ```
 
-## 4. 必须单独交接的实验产物
+## 4. 从零下载和准备 EgoExo4D 数据
+
+如果没有直接交接 `data/fact_egoexo/`，可以用下面命令重新生成主线数据。需要先获得 EgoExo4D / Ego4D 数据访问权限，并在 shell 中配置 AWS 凭据。
+
+### 4.1 环境变量
+
+```bash
+cd /data_all/sxh/FACT_tokenizer
+conda activate fact_tokenizer
+
+export AWS_ACCESS_KEY_ID=<your_egoexo_aws_access_key>
+export AWS_SECRET_ACCESS_KEY=<your_egoexo_aws_secret_key>
+export PYTHON_ENV_BIN=/home/sxh/.conda/envs/fact_tokenizer/bin
+```
+
+换机器后，把 `PYTHON_ENV_BIN` 改成新环境的 bin 目录。
+
+### 4.2 下载 metadata
+
+推荐先用官方 EgoExo CLI 下载 metadata：
+
+```bash
+mkdir -p data/egoexo4d
+
+${PYTHON_ENV_BIN}/egoexo \
+  -o data/egoexo4d \
+  --release v2 \
+  --parts metadata \
+  --views ego exo \
+  -y
+```
+
+完成后应至少有：
+
+```text
+data/egoexo4d/takes.json
+```
+
+### 4.3 选择 FACT 用的 take UID
+
+当前主线使用 diverse 500 takes：
+
+```bash
+${PYTHON_ENV_BIN}/python scripts/select_egoexo_fact_uids.py \
+  --egoexo-root data/egoexo4d \
+  --output-uids data/egoexo4d/fact_debug/uids_500_diverse.txt \
+  --output-jsonl data/egoexo4d/fact_debug/selected_takes_500_diverse.jsonl \
+  --max-takes 500 \
+  --min-duration-sec 48.5 \
+  --diverse
+```
+
+如果只想做 smoke test，可先选少量 takes：
+
+```bash
+${PYTHON_ENV_BIN}/python scripts/select_egoexo_fact_uids.py \
+  --egoexo-root data/egoexo4d \
+  --output-uids data/egoexo4d/fact_debug/uids.txt \
+  --output-jsonl data/egoexo4d/fact_debug/selected_takes.jsonl \
+  --max-takes 3 \
+  --min-duration-sec 8 \
+  --diverse
+```
+
+### 4.4 下载 downscaled Ego/Exo 视频
+
+方式 A：使用官方 EgoExo CLI，适合网络稳定时：
+
+```bash
+${PYTHON_ENV_BIN}/egoexo \
+  -o data/egoexo4d \
+  --release v2 \
+  --parts downscaled_takes/448 \
+  --views ego exo \
+  --uids $(cat data/egoexo4d/fact_debug/uids_500_diverse.txt) \
+  -y
+```
+
+仓库里也有封装脚本：
+
+```bash
+UID_FILE=data/egoexo4d/fact_debug/uids_500_diverse.txt \
+OUT_DIR=data/egoexo4d \
+RELEASE=v2 \
+PYTHON_ENV_BIN=${PYTHON_ENV_BIN} \
+bash scripts/download_egoexo_minimal.sh
+```
+
+方式 B：使用 manifest + boto3 按 UID 下载，适合官方 CLI 不稳定或需要更细控制并发时：
+
+```bash
+${PYTHON_ENV_BIN}/python scripts/download_egoexo_manifest_subset.py \
+  --uids data/egoexo4d/fact_debug/uids_500_diverse.txt \
+  --out-dir data/egoexo4d \
+  --manifest-cache data/egoexo4d/fact_debug/downscaled_448_manifest.json \
+  --failed-jsonl data/egoexo4d/fact_debug/download_failed.jsonl \
+  --num-workers 32 \
+  --transfer-concurrency 4
+```
+
+如果网络中途断流，可以改用 ranged 下载：
+
+```bash
+${PYTHON_ENV_BIN}/python scripts/download_egoexo_manifest_subset.py \
+  --uids data/egoexo4d/fact_debug/uids_500_diverse.txt \
+  --out-dir data/egoexo4d \
+  --manifest-cache data/egoexo4d/fact_debug/downscaled_448_manifest.json \
+  --failed-jsonl data/egoexo4d/fact_debug/download_failed_ranged.jsonl \
+  --num-workers 16 \
+  --download-mode ranged \
+  --chunk-size-mib 1 \
+  --chunk-workers 4 \
+  --chunk-retries 8
+```
+
+如果 `download_failed*.jsonl` 非空，重新运行同一条命令即可跳过已完整下载的文件，继续补缺。
+
+### 4.5 生成 transition48 NPZ 和 train/heldout split
+
+主线数据配置为 `transition_sec=0.5`、`stride_sec=1.0`、每 take 48 个 transition，并按 take 划分 80/20：
+
+```bash
+${PYTHON_ENV_BIN}/python scripts/prepare_fact_transition48_split.py \
+  --egoexo-root data/egoexo4d \
+  --selected-jsonl data/egoexo4d/fact_debug/selected_takes_500_diverse.jsonl \
+  --output-npz data/fact_egoexo/shards/train_diverse_500takes_t0p5_s1_48t_000000.npz \
+  --failed-jsonl data/fact_egoexo/failed_transition48_samples.jsonl \
+  --prepare-report data/fact_egoexo/shards/train_diverse_500takes_t0p5_s1_48t_000000_report.json \
+  --split-dir data/fact_egoexo/splits/diverse_500takes_t0p5_s1_48t_seed123_80_20 \
+  --samples-per-take 48 \
+  --stride-sec 1.0 \
+  --transition-sec 0.5 \
+  --resize 224 \
+  --heldout-fraction 0.2 \
+  --seed 123
+```
+
+默认不加 `--allow-short-takes`，因此短 take 会被跳过；保留下来的每个 take 必须严格写出 48 个 transition。
+
+### 4.6 可选：生成 transition_sec=1.0 对照
+
+v5p 做过 `transition_sec=1.0` 对照，结论是不推荐作为主线，但如果需要复现：
+
+```bash
+${PYTHON_ENV_BIN}/python scripts/prepare_fact_transition48_split.py \
+  --egoexo-root data/egoexo4d \
+  --selected-jsonl data/egoexo4d/fact_debug/selected_takes_500_diverse.jsonl \
+  --output-npz data/fact_egoexo/shards/train_diverse_500takes_t1p0_s1_48t_000000.npz \
+  --failed-jsonl data/fact_egoexo/failed_transition1p0_48_samples.jsonl \
+  --prepare-report data/fact_egoexo/shards/train_diverse_500takes_t1p0_s1_48t_000000_report.json \
+  --split-dir data/fact_egoexo/splits/diverse_500takes_t1p0_s1_48t_seed123_80_20 \
+  --samples-per-take 48 \
+  --stride-sec 1.0 \
+  --transition-sec 1.0 \
+  --resize 224 \
+  --heldout-fraction 0.2 \
+  --seed 123
+```
+
+### 4.7 快速检查数据
+
+```bash
+${PYTHON_ENV_BIN}/python - <<'PY'
+import numpy as np
+for path in [
+    "data/fact_egoexo/splits/diverse_500takes_t0p5_s1_48t_seed123_80_20/train_by_take.npz",
+    "data/fact_egoexo/splits/diverse_500takes_t0p5_s1_48t_seed123_80_20/heldout_by_take.npz",
+]:
+    with np.load(path, allow_pickle=False) as data:
+        print(path)
+        print({k: data[k].shape for k in data.files})
+PY
+```
+
+期望主线 split 约为：
+
+```text
+train:   342 takes / 16416 transitions
+heldout: 85 takes / 4080 transitions
+```
+
+## 5. 必须单独交接的实验产物
 
 最小 checkpoint / result 资产包建议包含：
 
@@ -94,7 +275,7 @@ visualizations/, if available
 - `outputs/lam_tokenizer/`，除非后续开发者要回看 LAM baseline。
 - 早期 smoke run 的完整 checkpoint；文档中已经总结工程闭环结果。
 
-## 5. 当前实验状态
+## 6. 当前实验状态
 
 当前一阶段 tokenizer 仍未通过 Stage-1 gate，不能冻结作为后续 WAM label tokenizer。
 
@@ -114,7 +295,7 @@ visualizations/, if available
 docs/fact_tokenizer_experiment_conclusions_20260618.md
 ```
 
-## 6. 推荐接手后的第一步
+## 7. 推荐接手后的第一步
 
 先补跑 v6c 的 heldout probe 和 gate：
 
@@ -143,7 +324,7 @@ docs/fact_tokenizer_experiment_conclusions_20260618.md
 - 重点重新设计 same-take / temporal action discrimination。
 - 不要只加大 usage regularization；v5r/v6c 已显示这会带来 leakage 或 hard usage 收缩。
 
-## 7. 环境和运行
+## 8. 环境和运行
 
 本地实验使用 conda 环境：
 
@@ -172,7 +353,7 @@ bash scripts/run_fact_transition48_v6c_usage_entropy_train.sh
 TORCHRUN=/path/to/torchrun bash scripts/run_fact_transition48_v6b_delta_full_train.sh
 ```
 
-## 8. 交付风险
+## 9. 交付风险
 
 - GitHub 上不包含大文件数据和 checkpoint。没有这些外部资产，后续只能阅读代码和文档，不能直接复现实验。
 - v6c 缺正式 heldout gate，是当前最需要补的实验验证。
