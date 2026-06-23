@@ -10,7 +10,7 @@ import os
 import sys
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, Iterator
+from typing import Dict, Iterator, Optional
 
 import numpy as np
 import torch
@@ -54,6 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--take-grouped-batches", action="store_true")
     parser.add_argument("--samples-per-take", type=int, default=4)
+    parser.add_argument("--mined-negative-map", type=Path, default=None)
+    parser.add_argument("--mined-negative-top-k", type=int, default=4)
+    parser.add_argument("--mined-pair-batches", action="store_true")
     parser.add_argument("--no-tf32", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -97,6 +100,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-aware-contrast-weight", type=float, default=0.0)
     parser.add_argument("--no-private-action-aware-contrast-weight", type=float, default=0.0)
     parser.add_argument("--action-aware-context-weight", type=float, default=0.35)
+    parser.add_argument("--mined-same-take-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--no-private-mined-same-take-contrast-weight", type=float, default=0.0)
     parser.add_argument("--action-contrast-margin", type=float, default=0.01)
     parser.add_argument("--action-aux-start-fraction", type=float, default=0.2)
     parser.add_argument("--action-aux-ramp-fraction", type=float, default=0.2)
@@ -257,6 +262,124 @@ class TakeGroupedBatchSampler(Sampler[list[int]]):
             yield batch
 
 
+class MinedPairBatchSampler(Sampler[list[int]]):
+    """Yield anchor/donor pairs so mined negatives are always in-batch."""
+
+    def __init__(
+        self,
+        donor_indices: torch.Tensor,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+        seed: int,
+        top_k: int,
+    ) -> None:
+        if batch_size <= 0 or batch_size % 2 != 0:
+            raise ValueError("--mined-pair-batches requires an even positive --batch-size")
+        if donor_indices.ndim != 2:
+            raise ValueError(f"donor_indices must be 2D, got shape {tuple(donor_indices.shape)}")
+        self.donor_indices = donor_indices.long()
+        self.num_samples = int(donor_indices.shape[0])
+        self.top_k = max(1, min(int(top_k), int(donor_indices.shape[1])))
+        self.batch_size = int(batch_size)
+        self.anchors_per_batch = self.batch_size // 2
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.batches_per_epoch = max(
+            1,
+            (self.num_samples + self.anchors_per_batch * self.world_size - 1)
+            // (self.anchors_per_batch * self.world_size),
+        )
+
+    def __len__(self) -> int:
+        return self.batches_per_epoch
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        anchor_generator = torch.Generator().manual_seed(self.seed + self.epoch * 1009)
+        donor_generator = torch.Generator().manual_seed(self.seed + self.epoch * 2003 + self.rank)
+        total_anchors = self.batches_per_epoch * self.anchors_per_batch * self.world_size
+        anchors = torch.randperm(self.num_samples, generator=anchor_generator)
+        if anchors.numel() < total_anchors:
+            extra = torch.randint(
+                self.num_samples,
+                (total_anchors - anchors.numel(),),
+                generator=anchor_generator,
+            )
+            anchors = torch.cat([anchors, extra], dim=0)
+        anchors = anchors[:total_anchors].reshape(self.batches_per_epoch, self.world_size, self.anchors_per_batch)
+        rank_anchors = anchors[:, self.rank]
+        for batch_anchors in rank_anchors:
+            batch: list[int] = []
+            for anchor_tensor in batch_anchors:
+                anchor = int(anchor_tensor.item())
+                candidates = self.donor_indices[anchor, : self.top_k]
+                valid = candidates[(candidates >= 0) & (candidates != anchor)]
+                if valid.numel() == 0:
+                    donor = anchor
+                else:
+                    donor = int(valid[torch.randint(valid.numel(), (1,), generator=donor_generator)].item())
+                batch.extend([anchor, donor])
+            yield batch
+
+
+def load_mined_negative_map(path: Optional[Path], expected_len: int, top_k: int) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if path is None:
+        return None, None
+    with np.load(path, allow_pickle=False) as data:
+        if "donor_index_topk" not in data:
+            raise KeyError(f"{path} is missing donor_index_topk")
+        donor_indices = np.asarray(data["donor_index_topk"], dtype=np.int64)
+        donor_scores = np.asarray(data["donor_score_topk"], dtype=np.float32) if "donor_score_topk" in data else None
+    if donor_indices.ndim != 2:
+        raise ValueError(f"donor_index_topk must be 2D, got shape {donor_indices.shape}")
+    if donor_indices.shape[0] != expected_len:
+        raise ValueError(f"donor_index_topk has {donor_indices.shape[0]} rows, expected {expected_len}")
+    if top_k <= 0 or top_k > donor_indices.shape[1]:
+        raise ValueError(f"--mined-negative-top-k must be in [1, {donor_indices.shape[1]}], got {top_k}")
+    if donor_scores is None:
+        donor_scores = np.ones_like(donor_indices, dtype=np.float32)
+    if donor_scores.shape != donor_indices.shape:
+        raise ValueError(f"donor_score_topk shape {donor_scores.shape} does not match {donor_indices.shape}")
+    return torch.from_numpy(donor_indices), torch.from_numpy(donor_scores)
+
+
+def attach_mined_negative_batch_fields(
+    batch: Dict[str, Dict[str, torch.Tensor]],
+    view_names: list[str],
+    donor_indices: Optional[torch.Tensor],
+    donor_scores: Optional[torch.Tensor],
+    top_k: int,
+) -> None:
+    if donor_indices is None or donor_scores is None:
+        return
+    reference = batch[view_names[0]]["sample_id"].long().cpu()
+    global_to_local = {int(sample_id): local for local, sample_id in enumerate(reference.tolist())}
+    local_indices = torch.full((reference.numel(),), -1, dtype=torch.long)
+    local_weights = torch.zeros((reference.numel(),), dtype=torch.float32)
+    for local, sample_id in enumerate(reference.tolist()):
+        sample_id = int(sample_id)
+        candidates = donor_indices[sample_id, :top_k]
+        scores = donor_scores[sample_id, :top_k]
+        for donor, score in zip(candidates.tolist(), scores.tolist()):
+            donor = int(donor)
+            if donor == sample_id or donor not in global_to_local:
+                continue
+            local_indices[local] = int(global_to_local[donor])
+            local_weights[local] = max(float(score), 0.0)
+            break
+    valid_weights = local_weights[local_weights > 0.0]
+    if valid_weights.numel() > 0:
+        local_weights = local_weights / valid_weights.mean().clamp_min(1e-6)
+    for view_name in view_names:
+        batch[view_name]["mined_negative_index"] = local_indices
+        batch[view_name]["mined_negative_weight"] = local_weights
+
+
 def main() -> None:
     args = parse_args()
     if torch.cuda.is_available() and not args.no_tf32:
@@ -283,9 +406,27 @@ def main() -> None:
         start_index=args.start_index,
         resize=args.resize,
     )
+    mined_donor_indices, mined_donor_scores = load_mined_negative_map(
+        args.mined_negative_map,
+        expected_len=len(dataset),
+        top_k=args.mined_negative_top_k,
+    )
+    if args.mined_pair_batches and mined_donor_indices is None:
+        raise ValueError("--mined-pair-batches requires --mined-negative-map")
+    if args.mined_pair_batches and args.take_grouped_batches:
+        raise ValueError("--mined-pair-batches and --take-grouped-batches are mutually exclusive")
     batch_sampler = None
     sampler = None
-    if args.take_grouped_batches:
+    if args.mined_pair_batches:
+        batch_sampler = MinedPairBatchSampler(
+            mined_donor_indices,
+            batch_size=args.batch_size,
+            rank=rank,
+            world_size=world_size,
+            seed=args.seed,
+            top_k=args.mined_negative_top_k,
+        )
+    elif args.take_grouped_batches:
         batch_sampler = TakeGroupedBatchSampler(
             dataset.take_indices,
             batch_size=args.batch_size,
@@ -341,6 +482,8 @@ def main() -> None:
         action_aware_contrast_weight=args.action_aware_contrast_weight,
         no_private_action_aware_contrast_weight=args.no_private_action_aware_contrast_weight,
         action_aware_context_weight=args.action_aware_context_weight,
+        mined_same_take_contrast_weight=args.mined_same_take_contrast_weight,
+        no_private_mined_same_take_contrast_weight=args.no_private_mined_same_take_contrast_weight,
         action_contrast_margin=args.action_contrast_margin,
         action_aux_start_fraction=args.action_aux_start_fraction,
         action_aux_ramp_fraction=args.action_aux_ramp_fraction,
@@ -383,6 +526,7 @@ def main() -> None:
         or args.no_private_same_take_contrast_weight > 0.0
         or args.no_private_temporal_offset_contrast_weight > 0.0
         or args.no_private_action_aware_contrast_weight > 0.0
+        or args.no_private_mined_same_take_contrast_weight > 0.0
         or args.no_private_delta_contrast_weight > 0.0
         or args.action_only_motion_focus_weight > 0.0
         or args.action_only_delta_focus_weight > 0.0
@@ -407,6 +551,12 @@ def main() -> None:
         args.action_aware_contrast_weight > 0.0
         or args.no_private_action_aware_contrast_weight > 0.0
     )
+    include_mined_same_take_action = (
+        args.mined_same_take_contrast_weight > 0.0
+        or args.no_private_mined_same_take_contrast_weight > 0.0
+    )
+    if include_mined_same_take_action and mined_donor_indices is None:
+        raise ValueError("Mined same-take contrast weights require --mined-negative-map")
     include_zero_action = args.zero_action_contrast_weight > 0.0 or args.no_private_zero_action_contrast_weight > 0.0
 
     history = []
@@ -454,6 +604,13 @@ def main() -> None:
                 batch_sampler.set_epoch(epoch)
             iterator = iter(loader)
             batch = next(iterator)
+        attach_mined_negative_batch_fields(
+            batch,
+            args.view_names,
+            mined_donor_indices,
+            mined_donor_scores,
+            args.mined_negative_top_k,
+        )
         optimizer.zero_grad(set_to_none=True)
         current_private_dropout = scheduled_scalar(
             step,
@@ -480,6 +637,7 @@ def main() -> None:
             temporal_offset=args.temporal_offset,
             include_action_aware_action=include_action_aware_action,
             action_aware_context_weight=args.action_aware_context_weight,
+            include_mined_same_take_action=include_mined_same_take_action,
             include_zero_action=include_zero_action,
             include_random_code_action=include_random_code_action,
         )
@@ -506,6 +664,7 @@ def main() -> None:
                     "history": history,
                     "optimizer_state": optimizer.state_dict(),
                     "step": step,
+                    "mined_negative_map": str(args.mined_negative_map) if args.mined_negative_map else None,
                 },
                 args.output_dir / f"fact_tokenizer_step_{step + 1:06d}.ckpt",
             )
@@ -539,6 +698,7 @@ def main() -> None:
             "history": history,
             "optimizer_state": optimizer.state_dict(),
             "step": args.steps - 1,
+            "mined_negative_map": str(args.mined_negative_map) if args.mined_negative_map else None,
         },
         checkpoint_path,
     )
@@ -553,6 +713,9 @@ def main() -> None:
             "view_names": args.view_names,
             "token_shape": list(indices.shape),
             "confidence_mean": float(confidence.mean()),
+            "mined_negative_map": str(args.mined_negative_map) if args.mined_negative_map else None,
+            "mined_negative_top_k": args.mined_negative_top_k if args.mined_negative_map else None,
+            "mined_pair_batches": bool(args.mined_pair_batches),
         },
     )
     print(f"Saved FACT tokenizer checkpoint to {checkpoint_path}")
