@@ -28,6 +28,8 @@ class FACTLossConfig:
     action_aware_contrast_weight: float = 0.0
     no_private_action_aware_contrast_weight: float = 0.0
     action_aware_context_weight: float = 0.35
+    mined_same_take_contrast_weight: float = 0.0
+    no_private_mined_same_take_contrast_weight: float = 0.0
     action_contrast_margin: float = 0.01
     action_aux_start_fraction: float = 0.2
     action_aux_ramp_fraction: float = 0.2
@@ -706,6 +708,22 @@ def compute_fact_loss(
         exo_aux_multiplier=config.exo_aux_multiplier,
         delta_focused=True,
     )
+    mined_same_take_contrast_loss = action_contrast_loss(
+        outputs,
+        positive_names=base_names,
+        suffix="_mined_same_take_action",
+        margin=config.action_contrast_margin,
+        exo_aux_multiplier=config.exo_aux_multiplier,
+        delta_focused=True,
+    )
+    no_private_mined_same_take_contrast_loss = action_contrast_loss(
+        outputs,
+        positive_names=no_private_names,
+        suffix="_mined_same_take_action",
+        margin=config.action_contrast_margin,
+        exo_aux_multiplier=config.exo_aux_multiplier,
+        delta_focused=True,
+    )
 
     action_only_weight = scheduled_aux_weight(
         step,
@@ -896,6 +914,20 @@ def compute_fact_loss(
         config.action_aux_start_fraction,
         config.action_aux_ramp_fraction,
     )
+    mined_same_take_contrast_weight = scheduled_aux_weight(
+        step,
+        total_steps,
+        config.mined_same_take_contrast_weight,
+        config.action_aux_start_fraction,
+        config.action_aux_ramp_fraction,
+    )
+    no_private_mined_same_take_contrast_weight = scheduled_aux_weight(
+        step,
+        total_steps,
+        config.no_private_mined_same_take_contrast_weight,
+        config.action_aux_start_fraction,
+        config.action_aux_ramp_fraction,
+    )
     take_uniform_weight = scheduled_aux_weight(
         step,
         total_steps,
@@ -955,6 +987,8 @@ def compute_fact_loss(
         + no_private_temporal_offset_contrast_weight * no_private_temporal_offset_contrast_loss
         + action_aware_contrast_weight * action_aware_contrast_loss
         + no_private_action_aware_contrast_weight * no_private_action_aware_contrast_loss
+        + mined_same_take_contrast_weight * mined_same_take_contrast_loss
+        + no_private_mined_same_take_contrast_weight * no_private_mined_same_take_contrast_loss
         + take_uniform_weight * take_uniform_loss
         + take_slot_uniform_weight * take_slot_uniform_loss
         + take_pair_uniform_weight * take_pair_uniform_loss
@@ -1008,6 +1042,8 @@ def compute_fact_loss(
         "no_private_temporal_offset_contrast_loss": float(no_private_temporal_offset_contrast_loss.detach().cpu()),
         "action_aware_contrast_loss": float(action_aware_contrast_loss.detach().cpu()),
         "no_private_action_aware_contrast_loss": float(no_private_action_aware_contrast_loss.detach().cpu()),
+        "mined_same_take_contrast_loss": float(mined_same_take_contrast_loss.detach().cpu()),
+        "no_private_mined_same_take_contrast_loss": float(no_private_mined_same_take_contrast_loss.detach().cpu()),
         "weight_self": weights["self"],
         "weight_swap": weights["swap"],
         "weight_kl": weights["kl"] * config.kl_weight,
@@ -1039,6 +1075,8 @@ def compute_fact_loss(
         "weight_no_private_temporal_offset_contrast": no_private_temporal_offset_contrast_weight,
         "weight_action_aware_contrast": action_aware_contrast_weight,
         "weight_no_private_action_aware_contrast": no_private_action_aware_contrast_weight,
+        "weight_mined_same_take_contrast": mined_same_take_contrast_weight,
+        "weight_no_private_mined_same_take_contrast": no_private_mined_same_take_contrast_weight,
         "weight_take_uniform": take_uniform_weight,
         "weight_take_slot_uniform": take_slot_uniform_weight,
         "weight_take_pair_uniform": take_pair_uniform_weight,

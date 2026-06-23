@@ -551,6 +551,34 @@ class FACTTokenizer(nn.Module):
         hardened["contrast_weight"] = contrast_weight.detach()
         return hardened
 
+    def _make_mined_same_take_action_view(
+        self,
+        view: Dict[str, torch.Tensor],
+        mined_negative_index: torch.Tensor | None,
+        mined_negative_weight: torch.Tensor | None,
+    ) -> Dict[str, torch.Tensor]:
+        mined = dict(view)
+        batch = view["z_q"].shape[0]
+        if batch <= 1 or mined_negative_index is None:
+            mined["z_q"] = view["z_q"]
+            mined["contrast_weight"] = view["z_q"].new_zeros(batch)
+            return mined
+
+        device = view["z_q"].device
+        index = mined_negative_index.to(device=device, dtype=torch.long)
+        valid = (index >= 0) & (index < batch)
+        self_index = torch.arange(batch, device=device)
+        valid = valid & (index != self_index)
+        safe_index = torch.where(valid, index, self_index)
+        if mined_negative_weight is None:
+            weight = valid.to(dtype=view["z_q"].dtype)
+        else:
+            weight = mined_negative_weight.to(device=device, dtype=view["z_q"].dtype).clamp_min(0.0)
+            weight = weight * valid.to(dtype=weight.dtype)
+        mined["z_q"] = view["z_q"].index_select(0, safe_index)
+        mined["contrast_weight"] = weight.detach()
+        return mined
+
     def _make_random_code_action_view(self, view: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         randomized = dict(view)
         indices = view["indices"]
@@ -584,6 +612,9 @@ class FACTTokenizer(nn.Module):
         temporal_offset: int = 4,
         action_aware_action: bool = False,
         action_aware_context_weight: float = 0.35,
+        mined_same_take_action: bool = False,
+        mined_negative_index: torch.Tensor | None = None,
+        mined_negative_weight: torch.Tensor | None = None,
         random_code_action: bool = False,
         action_slot_dropout: float = 0.0,
         loss_role: str = "base",
@@ -598,6 +629,12 @@ class FACTTokenizer(nn.Module):
                 views[act_view_name],
                 take_index=take_index,
                 context_weight=action_aware_context_weight,
+            )
+        elif mined_same_take_action:
+            act_view = self._make_mined_same_take_action_view(
+                views[act_view_name],
+                mined_negative_index=mined_negative_index,
+                mined_negative_weight=mined_negative_weight,
             )
         elif temporal_offset_action:
             act_view = self._make_temporal_offset_action_view(
@@ -644,6 +681,7 @@ class FACTTokenizer(nn.Module):
         temporal_offset: int = 4,
         include_action_aware_action: bool = False,
         action_aware_context_weight: float = 0.35,
+        include_mined_same_take_action: bool = False,
         include_zero_action: bool = False,
         include_random_code_action: bool = False,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
@@ -651,6 +689,8 @@ class FACTTokenizer(nn.Module):
         ego_name, exo_name = self.view_names
         take_index = batch[ego_name].get("take_index")
         timestamp = batch[ego_name].get("timestamp")
+        mined_negative_index = batch[ego_name].get("mined_negative_index")
+        mined_negative_weight = batch[ego_name].get("mined_negative_weight")
         reconstructions: Dict[str, Dict[str, torch.Tensor | str]] = {}
         base_specs = {
             "ego_self": (ego_name, ego_name),
@@ -844,6 +884,35 @@ class FACTTokenizer(nn.Module):
                         action_slot_dropout=action_slot_dropout,
                         loss_role="action_aware_negative_no_private",
                         take_index=take_index,
+                    )
+            if include_mined_same_take_action:
+                self._add_reconstruction(
+                    reconstructions,
+                    f"{name}_mined_same_take_action",
+                    obs_view_name,
+                    act_view_name,
+                    views,
+                    private_dropout=private_dropout,
+                    mined_same_take_action=True,
+                    mined_negative_index=mined_negative_index,
+                    mined_negative_weight=mined_negative_weight,
+                    action_slot_dropout=action_slot_dropout,
+                    loss_role="mined_same_take_negative",
+                )
+                if include_action_only:
+                    self._add_reconstruction(
+                        reconstructions,
+                        f"{name}_no_private_mined_same_take_action",
+                        obs_view_name,
+                        act_view_name,
+                        views,
+                        private_dropout=0.0,
+                        zero_private=True,
+                        mined_same_take_action=True,
+                        mined_negative_index=mined_negative_index,
+                        mined_negative_weight=mined_negative_weight,
+                        action_slot_dropout=action_slot_dropout,
+                        loss_role="mined_same_take_negative_no_private",
                     )
         return {
             "views": views,
