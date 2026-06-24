@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -49,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--torch-home",
+        type=Path,
+        default=None,
+        help="Override the checkpoint's saved torch hub cache path for DINOv2 weights.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--eval-paths",
@@ -301,6 +308,10 @@ def load_model_and_data(args: argparse.Namespace) -> tuple[FACTTokenizer, FACTPa
     model_config = dict(checkpoint["model_config"])
     if args.view_names:
         model_config["view_names"] = tuple(args.view_names)
+    if args.torch_home is not None:
+        torch_home = str(args.torch_home)
+        model_config["torch_home"] = torch_home
+        os.environ["TORCH_HOME"] = torch_home
     view_names = list(model_config.get("view_names", ("ego", "exo")))
     dataset = FACTPairedNPZDataset(
         input_npz=args.input_npz,
