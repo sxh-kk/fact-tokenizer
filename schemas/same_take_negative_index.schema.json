@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SameTakeNegativeIndexNpz",
+  "type": "object",
+  "required": ["donor_index_topk", "donor_score_topk", "take_uid", "timestamp", "sample_id"],
+  "properties": {
+    "donor_index_topk": {"description": "int64 [N, K], global row indices aligned to the filtered NPZ"},
+    "donor_score_topk": {"description": "float32 [N, K], non-negative pair weights"},
+    "donor_raw_score_topk": {"description": "float32 [N, K], unnormalized hard-negative scores"},
+    "take_uid": {"description": "string [N]"},
+    "timestamp": {"description": "float32 [N]"},
+    "sample_id": {"description": "string [N]"}
+  }
+}

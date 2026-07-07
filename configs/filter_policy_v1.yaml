@@ -1,0 +1,27 @@
+version: filtering_v1
+
+fact_main:
+  min_interaction_prob: 0.62
+  min_temporal_diversity: 0.10
+  max_scene_only: 0.45
+  blocked_probability_columns:
+    prob_diagnostic_candidate: 0.55
+    prob_discard: 0.45
+
+loco_aux:
+  min_loco_prob: 0.55
+  max_scene_only: 0.55
+  blocked_probability_columns:
+    prob_diagnostic_candidate: 0.60
+    prob_discard: 0.50
+
+sampling:
+  fact_main_weight: 1.0
+  loco_aux_weight: 0.25
+  discard_weight: 0.0
+
+split:
+  by_take: true
+  train_ratio: 0.8
+  heldout_ratio: 0.2
+  seed: 123

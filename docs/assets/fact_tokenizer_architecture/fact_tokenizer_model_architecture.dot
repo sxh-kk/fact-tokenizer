@@ -1,0 +1,110 @@
+digraph FACTTokenizerModelArchitecture {
+  graph [
+    rankdir=TB,
+    bgcolor="white",
+    pad="0.30",
+    nodesep="0.45",
+    ranksep="0.55",
+    splines=ortho,
+    fontname="Arial",
+    fontsize=18,
+    label="FACT Tokenizer Model Architecture: Factorized Shared Action Token Learning",
+    labelloc=t
+  ];
+
+  node [
+    shape=rect,
+    style="rounded,filled",
+    fontname="Arial",
+    fontsize=12,
+    color="#334155",
+    penwidth=1.2,
+    fillcolor="#F8FAFC",
+    margin="0.10,0.07"
+  ];
+
+  edge [
+    fontname="Arial",
+    fontsize=10,
+    color="#475569",
+    arrowsize=0.75,
+    penwidth=1.15
+  ];
+
+  ego_video [label="Ego transition\ncurrent_ego -> future_ego", fillcolor="#E0F2FE"];
+  exo_video [label="Exo transition\ncurrent_exo -> future_exo", fillcolor="#E0F2FE"];
+
+  dino_ego [label="Frozen DINOv2\nego patch features", fillcolor="#DBEAFE"];
+  dino_exo [label="Frozen DINOv2\nexo patch features", fillcolor="#DBEAFE"];
+
+  ego_enc [label="Ego factorized encoder\nTransformer over action/private queries + patches", fillcolor="#EDE9FE"];
+  exo_enc [label="Exo factorized encoder\nTransformer over action/private queries + patches", fillcolor="#EDE9FE"];
+
+  ego_z [label="z_act_ego\ncontinuous action latent", fillcolor="#F5D0FE"];
+  exo_z [label="z_act_exo\ncontinuous action latent", fillcolor="#F5D0FE"];
+  ego_priv [label="r_priv_ego\nview residual", fillcolor="#FFE4E6"];
+  exo_priv [label="r_priv_exo\nview residual", fillcolor="#FFE4E6"];
+
+  codebook [label="Shared action VQ codebook\nK action prototypes\nshared by Ego and Exo", fillcolor="#DDD6FE"];
+  q_ego [label="q_act_ego\nhard index + soft prob + confidence", fillcolor="#FAE8FF"];
+  q_exo [label="q_act_exo\nhard index + soft prob + confidence", fillcolor="#FAE8FF"];
+
+  ego_self [label="Ego self path\nego current + q_act_ego + r_priv_ego", fillcolor="#FFEDD5"];
+  exo_self [label="Exo self path\nexo current + q_act_exo + r_priv_exo", fillcolor="#FFEDD5"];
+  ego_swap [label="Ego swapped path\nego current + q_act_exo + r_priv_ego", fillcolor="#FED7AA"];
+  exo_swap [label="Exo swapped path\nexo current + q_act_ego + r_priv_exo", fillcolor="#FED7AA"];
+
+  decoder [label="Shared spatial decoder\nreconstruct future DINO patch features", fillcolor="#FDBA74"];
+  targets [label="Targets\nfuture_ego DINO features\nfuture_exo DINO features", fillcolor="#DBEAFE"];
+
+  losses [label="Losses\nself recon + swapped recon\nVQ + commitment\nconfidence-gated Exo KL\ncode usage balance\nprivate regularization\naction contrast / random-code / same-take / temporal\nmotion and delta auxiliary", fillcolor="#FEE2E2"];
+
+  export [label="Export after training\nEgo shared action tokens only\nindices / soft_probs / confidence", fillcolor="#BBF7D0"];
+  no_priv [label="Private residual is discarded\nnot WAM label\nnot downstream action signal", fillcolor="#FECACA"];
+
+  ego_video -> dino_ego;
+  exo_video -> dino_exo;
+  dino_ego -> ego_enc;
+  dino_exo -> exo_enc;
+  ego_enc -> ego_z;
+  ego_enc -> ego_priv;
+  exo_enc -> exo_z;
+  exo_enc -> exo_priv;
+  ego_z -> codebook;
+  exo_z -> codebook;
+  codebook -> q_ego;
+  codebook -> q_exo;
+
+  dino_ego -> ego_self;
+  dino_exo -> exo_self;
+  dino_ego -> ego_swap;
+  dino_exo -> exo_swap;
+  q_ego -> ego_self;
+  q_exo -> exo_self;
+  q_exo -> ego_swap;
+  q_ego -> exo_swap;
+  ego_priv -> ego_self;
+  exo_priv -> exo_self;
+  ego_priv -> ego_swap;
+  exo_priv -> exo_swap;
+
+  ego_self -> decoder;
+  exo_self -> decoder;
+  ego_swap -> decoder;
+  exo_swap -> decoder;
+  decoder -> losses;
+  targets -> losses;
+
+  losses -> ego_enc [label="train", style=dashed, color="#64748B"];
+  losses -> exo_enc [label="train", style=dashed, color="#64748B"];
+  losses -> codebook [label="train", style=dashed, color="#64748B"];
+  q_ego -> export;
+  ego_priv -> no_priv [style=dashed, color="#BE123C"];
+  exo_priv -> no_priv [style=dashed, color="#BE123C"];
+
+  {rank=same; ego_video; exo_video;}
+  {rank=same; ego_enc; exo_enc;}
+  {rank=same; ego_z; exo_z; ego_priv; exo_priv;}
+  {rank=same; q_ego; q_exo;}
+  {rank=same; ego_self; exo_self; ego_swap; exo_swap;}
+}

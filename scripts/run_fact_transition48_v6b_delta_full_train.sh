@@ -26,8 +26,8 @@ PER_GPU_BATCH="${PER_GPU_BATCH:-16}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
 
-if [[ ! -f "$TRAIN_NPZ" ]]; then
-  echo "Missing TRAIN_NPZ: $TRAIN_NPZ" >&2
+if [[ ! -f "$TRAIN_NPZ" && ! -d "$TRAIN_NPZ" ]]; then
+  echo "Missing TRAIN_NPZ path: $TRAIN_NPZ" >&2
   exit 1
 fi
 if [[ ! -f "$RESUME_CHECKPOINT" ]]; then

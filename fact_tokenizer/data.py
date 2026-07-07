@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -74,6 +74,98 @@ def _resize_video(video: torch.Tensor, resize: Optional[int]) -> torch.Tensor:
     return resized.reshape(batch, frames, channels, resize, resize).contiguous()
 
 
+def _prepare_video_sample(array: np.ndarray, frame_pair: str, start_index: int, resize: Optional[int]) -> torch.Tensor:
+    if array.ndim != 4:
+        raise ValueError(f"Expected a 4D per-sample array, got shape {array.shape}")
+    video = _to_float_chw(np.asarray(array).copy()[None])
+    video = _select_transition(video, frame_pair, start_index)
+    video = _resize_video(video, resize)
+    return video[0].contiguous()
+
+
+class FACTPairedNPYDataset(Dataset):
+    """Lazy paired transition dataset backed by a directory of ``.npy`` arrays."""
+
+    def __init__(
+        self,
+        input_dir: Path | str,
+        source_view_keys: Optional[Sequence[str]] = None,
+        output_view_names: Sequence[str] = ("ego", "exo"),
+        frame_pair: str = "first-last",
+        start_index: int = 0,
+        resize: Optional[int] = 224,
+    ) -> None:
+        self.input_dir = Path(input_dir)
+        self.output_view_names = list(output_view_names)
+        if len(self.output_view_names) != 2:
+            raise ValueError("FACT v0.1 expects exactly two output views: ego and exo")
+
+        keys = list(source_view_keys) if source_view_keys else self._infer_view_keys()
+        if len(keys) < 2:
+            raise ValueError("FACTPairedNPYDataset needs two synchronized views")
+        self.source_view_keys = keys[:2]
+        self.frame_pair = frame_pair
+        self.start_index = start_index
+        self.resize = resize
+        self._videos = {
+            output_name: np.load(self.input_dir / f"{source_name}.npy", mmap_mode="r")
+            for output_name, source_name in zip(self.output_view_names, self.source_view_keys)
+        }
+        batch_sizes = {int(value.shape[0]) for value in self._videos.values()}
+        if len(batch_sizes) != 1:
+            raise ValueError(f"All views must share batch size, got {sorted(batch_sizes)}")
+        self._num_samples = next(iter(batch_sizes))
+
+        take_uid_path = self.input_dir / "take_uid.npy"
+        timestamp_path = self.input_dir / "timestamp.npy"
+        if take_uid_path.exists():
+            take_uid = np.load(take_uid_path, mmap_mode="r").astype(str)
+            if len(take_uid) != self._num_samples:
+                raise ValueError(f"take_uid has length {len(take_uid)}, expected {self._num_samples}")
+            unique_takes = {uid: idx for idx, uid in enumerate(sorted(set(take_uid.tolist())))}
+            self.take_uids = take_uid.tolist()
+            self.take_indices = torch.tensor([unique_takes[uid] for uid in self.take_uids], dtype=torch.long)
+        else:
+            self.take_uids = [str(index) for index in range(self._num_samples)]
+            self.take_indices = torch.arange(self._num_samples, dtype=torch.long)
+
+        if timestamp_path.exists():
+            timestamp = np.load(timestamp_path, mmap_mode="r").astype(np.float32)
+            if len(timestamp) != self._num_samples:
+                raise ValueError(f"timestamp has length {len(timestamp)}, expected {self._num_samples}")
+            self.timestamps = torch.from_numpy(np.asarray(timestamp, dtype=np.float32))
+        else:
+            self.timestamps = torch.arange(self._num_samples, dtype=torch.float32)
+
+    def _infer_view_keys(self) -> list[str]:
+        preferred = [key for key in ("ego", "exo", "primary", "wrist") if (self.input_dir / f"{key}.npy").exists()]
+        remaining = [
+            path.stem
+            for path in sorted(self.input_dir.glob("*.npy"))
+            if path.stem not in preferred and np.load(path, mmap_mode="r").ndim == 5
+        ]
+        return (preferred + remaining)[:2]
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+    def __getitem__(self, index: int) -> Dict[str, Dict[str, torch.Tensor]]:
+        return {
+            view_name: {
+                "videos": _prepare_video_sample(
+                    self._videos[view_name][index],
+                    self.frame_pair,
+                    self.start_index,
+                    self.resize,
+                ),
+                "sample_id": torch.tensor(index, dtype=torch.long),
+                "take_index": self.take_indices[index],
+                "timestamp": self.timestamps[index],
+            }
+            for view_name in self.output_view_names
+        }
+
+
 class FACTPairedNPZDataset(Dataset):
     """In-memory paired transition dataset for FACT tokenizer smoke training.
 
@@ -93,6 +185,24 @@ class FACTPairedNPZDataset(Dataset):
         resize: Optional[int] = 224,
     ) -> None:
         self.input_npz = Path(input_npz)
+        if self.input_npz.is_dir():
+            self._delegate = FACTPairedNPYDataset(
+                input_dir=self.input_npz,
+                source_view_keys=source_view_keys,
+                output_view_names=output_view_names,
+                frame_pair=frame_pair,
+                start_index=start_index,
+                resize=resize,
+            )
+            self.output_view_names = self._delegate.output_view_names
+            self.source_view_keys = self._delegate.source_view_keys
+            self.frame_pair = self._delegate.frame_pair
+            self.resize = self._delegate.resize
+            self.take_uids = self._delegate.take_uids
+            self.take_indices = self._delegate.take_indices
+            self.timestamps = self._delegate.timestamps
+            return
+        self._delegate = None
         self.output_view_names = list(output_view_names)
         if len(self.output_view_names) != 2:
             raise ValueError("FACT v0.1 expects exactly two output views: ego and exo")
@@ -164,10 +274,14 @@ class FACTPairedNPZDataset(Dataset):
         return {key: data[key] for key in keys}
 
     def __len__(self) -> int:
+        if self._delegate is not None:
+            return len(self._delegate)
         first_view = self.output_view_names[0]
         return int(self.videos[first_view].shape[0])
 
     def __getitem__(self, index: int) -> Dict[str, Dict[str, torch.Tensor]]:
+        if self._delegate is not None:
+            return self._delegate[index]
         return {
             view_name: {
                 "videos": self.videos[view_name][index],

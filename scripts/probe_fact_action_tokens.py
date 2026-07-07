@@ -130,11 +130,17 @@ def load_npz_metadata(path: Path, expected_len: int) -> dict:
         "take_uid": [""] * expected_len,
         "timestamp": [float("nan")] * expected_len,
     }
-    with np.load(path, allow_pickle=False) as data:
+    if path.is_dir():
+        arrays = {}
         for key in ("sample_id", "take_uid", "timestamp"):
-            if key not in data:
-                continue
-            array = data[key]
+            array_path = path / f"{key}.npy"
+            if array_path.exists():
+                arrays[key] = np.load(array_path, mmap_mode="r", allow_pickle=False)
+    else:
+        with np.load(path, allow_pickle=False) as data:
+            arrays = {key: data[key] for key in ("sample_id", "take_uid", "timestamp") if key in data}
+
+    for key, array in arrays.items():
             if len(array) != expected_len:
                 raise ValueError(f"Metadata key {key!r} has length {len(array)}, expected {expected_len}")
             if key == "timestamp":

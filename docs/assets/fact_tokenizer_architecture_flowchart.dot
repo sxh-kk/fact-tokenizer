@@ -1,0 +1,347 @@
+digraph FACTTokenizerArchitecture {
+  graph [
+    rankdir=LR,
+    compound=true,
+    bgcolor="white",
+    pad="0.35",
+    nodesep="0.55",
+    ranksep="0.75",
+    splines=ortho,
+    outputorder=edgesfirst,
+    fontname="Noto Sans CJK SC"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    penwidth=1.25,
+    color="#51606f",
+    fillcolor="#f7f9fb",
+    fontname="Noto Sans CJK SC",
+    fontsize=18,
+    margin="0.16,0.10"
+  ];
+
+  edge [
+    color="#596b7a",
+    penwidth=1.4,
+    arrowsize=0.8,
+    fontname="Noto Sans CJK SC",
+    fontsize=15
+  ];
+
+  raw [
+    label="EgoExo4D 原始资产\nmetadata / downscaled videos / annotations",
+    fillcolor="#eef6ff",
+    color="#3c6ea8"
+  ];
+
+  take_select [
+    label="初始 take 选择\n500 diverse takes\nmin duration / task diversity",
+    fillcolor="#eef6ff",
+    color="#3c6ea8"
+  ];
+
+  transition48 [
+    label="transition48 构建\n0.5s transition, 1.0s stride\n48 transitions / take\ntrain/heldout split by take",
+    fillcolor="#eef6ff",
+    color="#3c6ea8"
+  ];
+
+  baseline_npz [
+    label="baseline transition48 NPZ\ntrain: 342 takes / 16416 transitions\nheldout: 85 takes / 4080 transitions",
+    fillcolor="#eef6ff",
+    color="#3c6ea8"
+  ];
+
+  subgraph cluster_filtering {
+    label="数据筛选 filtering_v2";
+    labelloc=t;
+    fontsize=22;
+    fontname="Noto Sans CJK SC";
+    color="#86a873";
+    penwidth=1.6;
+    style="rounded";
+
+    contact_sheet [
+      label="Contact Sheet\nEgo/Exo take-level 可视化\nmake_take_contact_sheets.py",
+      fillcolor="#f3fbef",
+      color="#6f9a5b"
+    ];
+
+    proxy_features [
+      label="多信号 proxy features\nmotion / hand-object / contact\nexo body / phase diversity\nscene-only risk",
+      fillcolor="#f3fbef",
+      color="#6f9a5b"
+    ];
+
+    merge_policy [
+      label="融合与规则预标注\nprob_tokenizer_main\nprob_loco_aux / discard / diagnostic\nfilter_policy_v2.yaml",
+      fillcolor="#f3fbef",
+      color="#6f9a5b"
+    ];
+
+    active_review [
+      label="主动复核 + 可选 VLM\nlow confidence / disagreement\nboundary samples\nhuman labels / VLM judge",
+      fillcolor="#f3fbef",
+      color="#6f9a5b"
+    ];
+
+    ranker [
+      label="Ranker 校准\nRandomForest relevance ranker\napply calibrated bucket scores",
+      fillcolor="#f3fbef",
+      color="#6f9a5b"
+    ];
+
+    filtered_split [
+      label="filtered_split_v2.json\nfact_main / loco_aux / diagnostic / discard\nsplit still by take",
+      fillcolor="#f3fbef",
+      color="#6f9a5b"
+    ];
+
+    filtered_npz [
+      label="Filtered FACT NPZ\nfact_main train: 308 takes / 14784 transitions\nfact_main heldout: 71 takes / 3408 transitions",
+      fillcolor="#e6f6df",
+      color="#5e8f49",
+      penwidth=2.0
+    ];
+
+    contact_sheet -> proxy_features;
+    proxy_features -> merge_policy;
+    merge_policy -> active_review;
+    active_review -> ranker;
+    ranker -> filtered_split;
+    filtered_split -> filtered_npz;
+  }
+
+  train_input [
+    label="训练输入\npaired Ego/Exo transition batch\ncurrent -> future",
+    fillcolor="#fff7e8",
+    color="#b5812b"
+  ];
+
+  subgraph cluster_model {
+    label="FACT Tokenizer 一阶段模型";
+    labelloc=t;
+    fontsize=22;
+    fontname="Noto Sans CJK SC";
+    color="#c69245";
+    penwidth=1.6;
+    style="rounded";
+
+    ego_video [
+      label="Ego transition\ncurrent_ego, future_ego",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    exo_video [
+      label="Exo transition\ncurrent_exo, future_exo",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    dino [
+      label="Frozen DINOv2\npatch feature extractor\nno gradient",
+      fillcolor="#fff0d8",
+      color="#b5812b",
+      penwidth=2.0
+    ];
+
+    ego_feat [
+      label="Ego DINO patch features\ncurrent patches + target patches",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    exo_feat [
+      label="Exo DINO patch features\ncurrent patches + target patches",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    ego_encoder [
+      label="Ego factorized encoder\nTransformer blocks\nlearned action/private queries",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    exo_encoder [
+      label="Exo factorized encoder\nTransformer blocks\nlearned action/private queries",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    ego_act [
+      label="z_act_ego\ncontinuous action latent",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    exo_act [
+      label="z_act_exo\ncontinuous action latent",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    ego_priv [
+      label="r_priv_ego\nview-private residual\ntraining auxiliary only",
+      fillcolor="#fdecea",
+      color="#b7655d"
+    ];
+
+    exo_priv [
+      label="r_priv_exo\nview-private residual\ntraining auxiliary only",
+      fillcolor="#fdecea",
+      color="#b7655d"
+    ];
+
+    vq [
+      label="Shared Action VQ Codebook\nK=64, action slots=4\nhard indices + soft_probs + confidence",
+      fillcolor="#ffe7c2",
+      color="#b5812b",
+      penwidth=2.2
+    ];
+
+    q_ego [
+      label="q_act_ego\nEgo shared action tokens",
+      fillcolor="#ffe7c2",
+      color="#b5812b"
+    ];
+
+    q_exo [
+      label="q_act_exo\nExo shared action tokens",
+      fillcolor="#ffe7c2",
+      color="#b5812b"
+    ];
+
+    decoder [
+      label="Spatial decoder\ncurrent context + shared action + private residual\npredict future DINO patches",
+      fillcolor="#fff0d8",
+      color="#b5812b",
+      penwidth=2.0
+    ];
+
+    self_recon [
+      label="Within-view reconstruction\nEgo: ego current + q_ego + r_ego -> ego future\nExo: exo current + q_exo + r_exo -> exo future",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    swap_recon [
+      label="Swapped reconstruction\nEgo: ego current + q_exo + r_ego -> ego future\nExo: exo current + q_ego + r_exo -> exo future",
+      fillcolor="#fff8ed",
+      color="#b5812b"
+    ];
+
+    losses [
+      label="训练目标\nL_self + L_swap + L_vq\nconfidence-gated Exo KL\nusage balance + private regularization\naction/random-code/same-take/temporal contrast",
+      fillcolor="#fff0d8",
+      color="#b5812b",
+      penwidth=2.0
+    ];
+
+    ego_video -> dino;
+    exo_video -> dino;
+    dino -> ego_feat;
+    dino -> exo_feat;
+    ego_feat -> ego_encoder;
+    exo_feat -> exo_encoder;
+    ego_encoder -> ego_act;
+    ego_encoder -> ego_priv;
+    exo_encoder -> exo_act;
+    exo_encoder -> exo_priv;
+    ego_act -> vq;
+    exo_act -> vq;
+    vq -> q_ego;
+    vq -> q_exo;
+    ego_feat -> decoder [label="current context", color="#a98242"];
+    exo_feat -> decoder [label="current context", color="#a98242"];
+    q_ego -> decoder;
+    q_exo -> decoder;
+    ego_priv -> decoder [color="#b7655d"];
+    exo_priv -> decoder [color="#b7655d"];
+    decoder -> self_recon;
+    decoder -> swap_recon;
+    self_recon -> losses;
+    swap_recon -> losses;
+  }
+
+  checkpoint [
+    label="训练产物\nfact_tokenizer.ckpt\ntrain_history / code_usage / logs",
+    fillcolor="#f1edff",
+    color="#7b62b3"
+  ];
+
+  token_export [
+    label="Token 导出\n只导出 Ego shared action branch\nindices / soft_probs / confidence\n不导出 private residual",
+    fillcolor="#f1edff",
+    color="#7b62b3",
+    penwidth=2.0
+  ];
+
+  probe [
+    label="Tokenizer quality validation\ncausality ablation\nprivate leakage ablation\nsemantic probe",
+    fillcolor="#edf3ff",
+    color="#5578b8"
+  ];
+
+  gate [
+    label="Stage-1 Gate\nrandom-take / random-code / same-take delta\nview NMI / take NMI\nheldout ego code usage\nprivate-only gap",
+    shape=diamond,
+    margin="0.18,0.12",
+    fillcolor="#edf3ff",
+    color="#5578b8",
+    penwidth=2.0
+  ];
+
+  fail_loop [
+    label="未通过：继续迭代\n数据筛选：filtering_v2 / phase-aware negatives\n训练目标：usage + anti-leakage + action causality\n当前状态：尚不能冻结给 WAM",
+    fillcolor="#fdecec",
+    color="#b85c5c",
+    penwidth=2.0
+  ];
+
+  freeze [
+    label="通过后：冻结 shared action token space\nfreeze shared codebook / quantizer / ego action encoder\n生成稳定 Ego token labels",
+    fillcolor="#e9f7ef",
+    color="#4d9a69",
+    penwidth=2.0
+  ];
+
+  downstream [
+    label="后续阶段接口\nEgo-only WAM labels\nVideo DiT / Action Head / robot ego adapter\nprivate residual 不进入下游",
+    fillcolor="#e9f7ef",
+    color="#4d9a69"
+  ];
+
+  raw -> take_select;
+  take_select -> transition48;
+  transition48 -> baseline_npz;
+  baseline_npz -> contact_sheet [lhead=cluster_filtering];
+  baseline_npz -> train_input [label="baseline training"];
+  filtered_npz -> train_input [label="filtered fact_main training"];
+
+  train_input -> ego_video [lhead=cluster_model];
+  train_input -> exo_video [lhead=cluster_model];
+  losses -> checkpoint [ltail=cluster_model];
+  checkpoint -> token_export;
+  checkpoint -> probe;
+  token_export -> probe;
+  probe -> gate;
+  gate -> freeze [label="pass"];
+  gate -> fail_loop [label="fail"];
+  fail_loop -> proxy_features [label="data-side repair", color="#b85c5c", lhead=cluster_filtering];
+  fail_loop -> train_input [label="loss/model recipe repair", color="#b85c5c"];
+  freeze -> downstream;
+
+  private_note [
+    label="设计约束\nShared action token = 后续可用动作标签\nPrivate residual = tokenizer 训练辅助\n禁止作为 WAM label 导出",
+    shape=note,
+    fillcolor="#fffbe6",
+    color="#c2a246",
+    penwidth=1.6
+  ];
+
+  private_note -> token_export [style=dashed, color="#c2a246", arrowhead=none];
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FilteredSplit",
+  "type": "object",
+  "required": ["version", "splits"],
+  "properties": {
+    "version": {"type": "string"},
+    "policy": {"type": "object"},
+    "splits": {
+      "type": "object",
+      "required": ["train", "heldout"],
+      "properties": {
+        "train": {"$ref": "#/$defs/splitBuckets"},
+        "heldout": {"$ref": "#/$defs/splitBuckets"}
+      }
+    }
+  },
+  "$defs": {
+    "splitBuckets": {
+      "type": "object",
+      "required": ["fact_main", "loco_aux", "discard"],
+      "properties": {
+        "fact_main": {"type": "array", "items": {"$ref": "#/$defs/take"}},
+        "loco_aux": {"type": "array", "items": {"$ref": "#/$defs/take"}},
+        "discard": {"type": "array", "items": {"$ref": "#/$defs/take"}}
+      }
+    },
+    "take": {
+      "type": "object",
+      "required": ["take_uid"],
+      "properties": {
+        "take_uid": {"type": "string"},
+        "parent_task_name": {"type": "string"},
+        "task_name": {"type": "string"},
+        "relevance_score": {"type": "number"},
+        "interaction_prob": {"type": "number"},
+        "loco_prob": {"type": "number"},
+        "scene_only_score": {"type": "number"},
+        "temporal_diversity_score": {"type": "number"}
+      }
+    }
+  }
+}

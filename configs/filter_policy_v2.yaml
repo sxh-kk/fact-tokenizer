@@ -1,0 +1,43 @@
+version: filtering_v2
+
+fact_main:
+  min_tokenizer_main_prob: 0.60
+  min_hand_object_contact: 0.35
+  min_phase_diversity: 0.18
+  max_scene_only: 0.42
+  max_discard_prob: 0.45
+  max_diagnostic_prob: 0.58
+  vlm_strong_main_prob: 0.78
+  allow_vlm_override: true
+
+loco_aux:
+  min_loco_aux_prob: 0.58
+  min_exo_body_visibility: 0.35
+  min_body_phase_diversity: 0.18
+  max_scene_only: 0.55
+  max_discard_prob: 0.50
+
+diagnostic_candidate:
+  min_diagnostic_prob: 0.52
+  fine_dexterous_score: 0.62
+  high_disagreement_score: 0.45
+
+active_review:
+  low_confidence_threshold: 0.62
+  high_disagreement_threshold: 0.35
+  boundary_margin: 0.08
+  random_audit_fraction: 0.10
+  always_review_fact_main_border: true
+
+sampling:
+  fact_main_transitions_per_take: 48
+  loco_aux_transitions_per_take: 12
+  fact_main_weight: 1.0
+  loco_aux_weight: 0.25
+  discard_weight: 0.0
+
+split:
+  by_take: true
+  train_ratio: 0.8
+  heldout_ratio: 0.2
+  seed: 123

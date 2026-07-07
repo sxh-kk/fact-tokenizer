@@ -1,0 +1,122 @@
+digraph FACTTokenizerPaperPipeline {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.25",
+    nodesep="0.42",
+    ranksep="0.62",
+    splines=ortho,
+    outputorder=edgesfirst,
+    fontname="Helvetica",
+    fontsize=18,
+    labelloc=t,
+    label="FACT Tokenizer: Data Filtering and Shared Action Token Learning"
+  ];
+
+  node [
+    shape=rect,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=11,
+    color="#202020",
+    penwidth=1.15,
+    fillcolor="white",
+    margin="0.11,0.07"
+  ];
+
+  edge [
+    fontname="Helvetica",
+    fontsize=9,
+    color="#303030",
+    arrowsize=0.65,
+    penwidth=1.05
+  ];
+
+  subgraph cluster_filter {
+    label="Data filtering";
+    fontname="Helvetica-Bold";
+    fontsize=13;
+    color="#BDBDBD";
+    penwidth=1.0;
+    style="rounded";
+
+    raw [label="Paired Ego/Exo videos\nmetadata + take labels"];
+    transitions [label="Transition split\nby take"];
+    signals [label="Take-level signals\ncontact | phase | body motion\nscene-only risk"];
+    policy [label="Filtering policy\n+ active review"];
+    filtered [label="Filtered NPZ\nfact_main train/heldout"];
+  }
+
+  subgraph cluster_tokenizer {
+    label="FACT tokenizer";
+    fontname="Helvetica-Bold";
+    fontsize=13;
+    color="#BDBDBD";
+    penwidth=1.0;
+    style="rounded";
+
+    dino [label="Frozen DINOv2\npatch features"];
+    ego_enc [label="Ego encoder"];
+    exo_enc [label="Exo encoder"];
+    act_latent [label="Shared action latents\nz_act^ego, z_act^exo"];
+    vq [label="Shared VQ codebook\nK action prototypes", penwidth=1.6];
+    qego [label="q_act^ego"];
+    qexo [label="q_act^exo"];
+    priv [label="Private residuals\nr_priv^ego, r_priv^exo"];
+    recon [label="Future reconstruction\nself + swapped"];
+    losses [label="Training losses\nrecon | KL | VQ | usage\ncontrast | private reg"];
+  }
+
+  subgraph cluster_eval {
+    label="Validation and handoff";
+    fontname="Helvetica-Bold";
+    fontsize=13;
+    color="#BDBDBD";
+    penwidth=1.0;
+    style="rounded";
+
+    export [label="Export ego tokens\nindex + prob + confidence"];
+    probe [label="Heldout probes\ncausality | leakage | usage"];
+    gate [shape=diamond, label="Stage-1\ngate", margin="0.08,0.05"];
+    freeze [label="Freeze shared\naction token space"];
+    iterate [label="Iterate data / losses"];
+    downstream [label="Later stages\nEgo-only WAM\nAction Head"];
+  }
+
+  raw -> transitions;
+  transitions -> signals;
+  signals -> policy;
+  policy -> filtered;
+
+  filtered -> dino;
+  dino -> ego_enc;
+  dino -> exo_enc;
+  ego_enc -> act_latent;
+  exo_enc -> act_latent;
+  act_latent -> vq;
+  vq -> qego;
+  vq -> qexo;
+  ego_enc -> priv;
+  exo_enc -> priv;
+  qego -> recon;
+  qexo -> recon;
+  priv -> recon;
+  dino -> recon [label="current context"];
+  recon -> losses;
+  losses -> ego_enc [style=dashed, color="#6B6B6B", label="train"];
+  losses -> exo_enc [style=dashed, color="#6B6B6B"];
+  losses -> vq [style=dashed, color="#6B6B6B"];
+
+  qego -> export;
+  export -> probe;
+  probe -> gate;
+  gate -> freeze [label="pass"];
+  gate -> iterate [label="fail"];
+  freeze -> downstream;
+  iterate -> policy [style=dashed, color="#6B6B6B"];
+  iterate -> losses [style=dashed, color="#6B6B6B"];
+
+  { rank=same; ego_enc; exo_enc; }
+  { rank=same; qego; qexo; priv; }
+  { rank=same; freeze; iterate; }
+}

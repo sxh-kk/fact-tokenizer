@@ -1,0 +1,141 @@
+digraph FACTTokenizerFullPipeline {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.35",
+    nodesep="0.45",
+    ranksep="0.70",
+    splines=ortho,
+    fontname="Arial",
+    fontsize=18,
+    label="FACT Tokenizer MVP: Data Filtering, Shared Action Token Learning, and Stage-1 Gate",
+    labelloc=t
+  ];
+
+  node [
+    shape=rect,
+    style="rounded,filled",
+    fontname="Arial",
+    fontsize=12,
+    color="#334155",
+    penwidth=1.3,
+    fillcolor="#F8FAFC",
+    margin="0.10,0.07"
+  ];
+
+  edge [
+    fontname="Arial",
+    fontsize=10,
+    color="#475569",
+    arrowsize=0.75,
+    penwidth=1.2
+  ];
+
+  subgraph cluster_data {
+    label="1. Data Source and Filtering v2";
+    color="#CBD5E1";
+    style="rounded,filled";
+    fillcolor="#F8FAFC";
+
+    egoexo [label="EgoExo4D paired videos\nEgo view + Exo view + metadata", fillcolor="#E0F2FE"];
+    transition48 [label="Transition construction\n0.5s window, 1.0s stride\n48 transitions / take\nTake-level train / heldout split", fillcolor="#DBEAFE"];
+    contact_sheets [label="Contact sheets\nper-take Ego/Exo visual summary", fillcolor="#EEF2FF"];
+    proxy_features [label="Take-level proxy features\n- ego motion\n- hand/object/contact\n- contact state change\n- exo body/loco\n- phase diversity\n- scene-only risk", fillcolor="#F0FDFA"];
+    vlm_human [label="VLM + active human review\nlow confidence / disagreement / boundary cases", fillcolor="#FEF3C7"];
+    merge_policy [label="Feature fusion + policy\nprob_tokenizer_main\nprob_loco_aux\nprob_discard\nprob_diagnostic", fillcolor="#FFFBEB"];
+    ranker [label="Optional calibrated ranker\nRandomForest from manual labels", fillcolor="#FDE68A"];
+    filtered_split [label="Filtered split JSON\nfact_main / loco_aux / diagnostic / discard", fillcolor="#DCFCE7"];
+    filtered_npz [label="Materialized filtered NPZ\nfact_main train/heldout\nEgo/Exo transition tensors", fillcolor="#BBF7D0"];
+  }
+
+  subgraph cluster_model {
+    label="2. FACT Tokenizer Training";
+    color="#CBD5E1";
+    style="rounded,filled";
+    fillcolor="#FFFFFF";
+
+    paired_npz [label="Paired transition batch\nego: current -> future\nexo: current -> future", fillcolor="#E0F2FE"];
+    dino [label="Frozen DINOv2 feature extractor\npatch tokens as reconstruction target", fillcolor="#DBEAFE"];
+
+    ego_encoder [label="Ego factorized encoder\nz_act_ego + r_priv_ego", fillcolor="#EDE9FE"];
+    exo_encoder [label="Exo factorized encoder\nz_act_exo + r_priv_exo", fillcolor="#EDE9FE"];
+
+    vq [label="Shared action VQ codebook\nK=64 action prototypes\nquantize z_act only", fillcolor="#DDD6FE"];
+    ego_q [label="q_act_ego\nindices + soft_probs + confidence", fillcolor="#F5D0FE"];
+    exo_q [label="q_act_exo\nexo weak teacher assignment", fillcolor="#F5D0FE"];
+
+    private [label="Private residual branches\ncontinuous view residuals\ntraining auxiliary only\nNOT exported", fillcolor="#FFE4E6"];
+
+    decoder [label="Spatial decoder\ncurrent context + q_act + r_priv\n-> future DINO patch features", fillcolor="#FED7AA"];
+
+    self_recon [label="Within-view reconstruction\nego q -> ego future\nexo q -> exo future", fillcolor="#FFEDD5"];
+    swap_recon [label="Swapped reconstruction\nexo q + ego private -> ego future\nego q + exo private -> exo future", fillcolor="#FFEDD5"];
+
+    losses [label="Training objectives\nL_self + L_swap + VQ\nconfidence-gated KL\nusage balance\nprivate regularization\naction/random-code/same-take/temporal contrasts\nmotion/delta auxiliary", fillcolor="#FEE2E2"];
+  }
+
+  subgraph cluster_export {
+    label="3. Export and Validation";
+    color="#CBD5E1";
+    style="rounded,filled";
+    fillcolor="#F8FAFC";
+
+    export_tokens [label="Export ego shared action tokens only\nindices\nsoft_probs\nconfidence", fillcolor="#DCFCE7"];
+    no_private_export [label="Private residual not exported\nnot WAM label\nnot downstream action signal", fillcolor="#FFE4E6"];
+    probe [label="Heldout probes\ncausality ablation\nprivate leakage\nsemantic controls", fillcolor="#E0E7FF"];
+    gate [shape=diamond, label="Stage-1 gate passed?", fillcolor="#FEF9C3", margin="0.12,0.06"];
+    freeze [label="Freeze shared action token space\nuse ego tokens as WAM labels", fillcolor="#BBF7D0"];
+    iterate [label="Iterate data + losses\ncurrent status: not passed\nfocus: same-take causality\ntake leakage\nheldout code usage", fillcolor="#FECACA"];
+    downstream [label="Later stages only after gate\nEgo-only WAM\nVideo DiT / Action Head\nRobot adapter", fillcolor="#C7D2FE"];
+  }
+
+  egoexo -> transition48;
+  transition48 -> contact_sheets;
+  transition48 -> proxy_features;
+  contact_sheets -> vlm_human;
+  proxy_features -> merge_policy;
+  vlm_human -> merge_policy;
+  merge_policy -> ranker [label="manual labels optional"];
+  ranker -> filtered_split [label="calibrated scores"];
+  merge_policy -> filtered_split [label="rule-based MVP"];
+  filtered_split -> filtered_npz [label="select fact_main transitions"];
+
+  filtered_npz -> paired_npz;
+  paired_npz -> dino;
+  dino -> ego_encoder [label="ego patch tokens"];
+  dino -> exo_encoder [label="exo patch tokens"];
+  ego_encoder -> vq [label="z_act_ego"];
+  exo_encoder -> vq [label="z_act_exo"];
+  vq -> ego_q;
+  vq -> exo_q;
+  ego_encoder -> private [label="r_priv_ego"];
+  exo_encoder -> private [label="r_priv_exo"];
+
+  ego_q -> self_recon;
+  exo_q -> self_recon;
+  ego_q -> swap_recon;
+  exo_q -> swap_recon;
+  private -> self_recon;
+  private -> swap_recon;
+  dino -> decoder [label="current context"];
+  self_recon -> decoder;
+  swap_recon -> decoder;
+  decoder -> losses;
+  losses -> ego_encoder [label="backprop", style=dashed, color="#64748B"];
+  losses -> exo_encoder [label="backprop", style=dashed, color="#64748B"];
+  losses -> vq [label="codebook update", style=dashed, color="#64748B"];
+
+  ego_q -> export_tokens;
+  private -> no_private_export [style=dashed, color="#BE123C"];
+  export_tokens -> probe;
+  probe -> gate;
+  gate -> freeze [label="yes"];
+  gate -> iterate [label="no"];
+  freeze -> downstream;
+  iterate -> transition48 [label="improve sampling/filtering", style=dashed, color="#DC2626"];
+  iterate -> losses [label="improve objectives", style=dashed, color="#DC2626"];
+
+  {rank=same; ego_encoder; exo_encoder;}
+  {rank=same; self_recon; swap_recon;}
+  {rank=same; freeze; iterate;}
+}

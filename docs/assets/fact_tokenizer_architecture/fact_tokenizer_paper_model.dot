@@ -1,0 +1,109 @@
+digraph FACTTokenizerPaperModel {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.20",
+    nodesep="0.38",
+    ranksep="0.55",
+    splines=ortho,
+    outputorder=edgesfirst,
+    fontname="Helvetica",
+    fontsize=18,
+    labelloc=t,
+    label="FACT Tokenizer: Factorized Shared Action Codebook"
+  ];
+
+  node [
+    shape=rect,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=11,
+    color="#202020",
+    penwidth=1.15,
+    fillcolor="white",
+    margin="0.10,0.07"
+  ];
+
+  edge [
+    fontname="Helvetica",
+    fontsize=9,
+    color="#303030",
+    arrowsize=0.65,
+    penwidth=1.05
+  ];
+
+  ego_in [label="Ego transition\nx_t^ego, x_{t+1}^ego"];
+  exo_in [label="Exo transition\nx_t^exo, x_{t+1}^exo"];
+  dino [label="Frozen DINOv2\npatch tokens", penwidth=1.35];
+
+  ego_enc [label="Ego encoder"];
+  exo_enc [label="Exo encoder"];
+
+  ego_act [label="z_act^ego"];
+  exo_act [label="z_act^exo"];
+  ego_priv [label="r_priv^ego"];
+  exo_priv [label="r_priv^exo"];
+
+  codebook [label="Shared action\nVQ codebook", penwidth=1.8];
+  qego [label="q_act^ego"];
+  qexo [label="q_act^exo"];
+
+  ego_self [label="Ego self\nq_ego + r_ego"];
+  exo_self [label="Exo self\nq_exo + r_exo"];
+  ego_swap [label="Ego swapped\nq_exo + r_ego"];
+  exo_swap [label="Exo swapped\nq_ego + r_exo"];
+  dec [label="Decoder\nfuture DINO features", penwidth=1.35];
+
+  align [label="Confidence-gated\nExo alignment"];
+  balance [label="Code usage\nbalancing"];
+  private_reg [label="Private residual\nbottleneck"];
+  contrast [label="Action negatives\nrandom-code | same-take | temporal"];
+
+  export [label="Export only\nq_act^ego", penwidth=1.55];
+
+  ego_in -> dino;
+  exo_in -> dino;
+  dino -> ego_enc [label="ego"];
+  dino -> exo_enc [label="exo"];
+  ego_enc -> ego_act;
+  exo_enc -> exo_act;
+  ego_enc -> ego_priv;
+  exo_enc -> exo_priv;
+  ego_act -> codebook;
+  exo_act -> codebook;
+  codebook -> qego;
+  codebook -> qexo;
+
+  qego -> ego_self;
+  qexo -> exo_self;
+  qexo -> ego_swap;
+  qego -> exo_swap;
+  ego_priv -> ego_self;
+  exo_priv -> exo_self;
+  ego_priv -> ego_swap;
+  exo_priv -> exo_swap;
+
+  ego_self -> dec;
+  exo_self -> dec;
+  ego_swap -> dec;
+  exo_swap -> dec;
+
+  qego -> align;
+  qexo -> align;
+  qego -> balance;
+  qexo -> balance;
+  ego_priv -> private_reg;
+  exo_priv -> private_reg;
+  qego -> contrast;
+  qexo -> contrast;
+
+  qego -> export;
+  ego_priv -> export [style=dashed, color="#9A3412", label="not exported"];
+
+  { rank=same; ego_in; exo_in; }
+  { rank=same; ego_enc; exo_enc; }
+  { rank=same; ego_act; exo_act; ego_priv; exo_priv; }
+  { rank=same; qego; qexo; }
+  { rank=same; ego_self; exo_self; ego_swap; exo_swap; }
+  { rank=same; align; balance; private_reg; contrast; }
+}

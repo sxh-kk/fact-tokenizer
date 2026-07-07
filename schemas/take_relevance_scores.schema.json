@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TakeRelevanceScoresCsvColumns",
+  "type": "array",
+  "items": {
+    "type": "string",
+    "enum": [
+      "take_uid",
+      "split",
+      "parent_task_name",
+      "task_name",
+      "take_name",
+      "num_transitions",
+      "ego_motion_score",
+      "exo_body_motion_score",
+      "object_motion_proxy",
+      "temporal_diversity_score",
+      "metadata_interaction_prior",
+      "metadata_loco_prior",
+      "scene_only_score",
+      "interaction_score",
+      "loco_score",
+      "fine_dexterous_score",
+      "relevance_score",
+      "auto_bucket",
+      "contact_sheet_path"
+    ]
+  }
+}
