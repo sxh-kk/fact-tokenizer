@@ -383,3 +383,138 @@ causality 结论：
 - take/scene shortcut 风险下降。
 - filtered split 的 parent task / scene / phase 分布不过窄。
 
+## 12. 2026-07-08 hard filter / soft filter / augmentation 对比结论
+
+本轮目标不是用 tokenizer 反向校正 filter，而是在固定 tokenizer 配置和同一 heldout 条件下，验证不同数据策略是否改善 FACT tokenizer 的 shared action token 学习。
+
+### 12.1 实验设置
+
+共同设置：
+
+- 起点 checkpoint：`outputs/fact_tokenizer/v6b_transition48_delta_full_from_v5p_8gpu_20260620_2200/fact_tokenizer.ckpt`
+- 训练区间：`90000 -> 90999`，共 1000 steps。
+- 主要 heldout：`outputs/fact_tokenizer/nofilter_t1p0_heldout_by_take_npy_mmap`
+- probe：`scripts/probe_fact_action_tokens.py`
+- 汇总文件：
+  - `outputs/fact_tokenizer/ab_logs/filter_weight_aug_ab_20260708_summary.json`
+  - `outputs/fact_tokenizer/ab_logs/filter_weight_aug_ab_20260708_metrics.csv`
+
+| variant | train data / strategy | probe samples | 说明 |
+| --- | --- | ---: | --- |
+| `nofilter_baseline` | full no-filter train | 4080 | 原始 no-filter baseline |
+| `hard_filter_balanced` | hard-filter balanced train | 1056 | 只保留 `fact_main_balanced`，heldout 也缩小；不完全同分布可比 |
+| `weighted_soft_filter_v1` | full train + take-level quality weighted sampler | 4080 | 保留 full data diversity，只降低低质量 take 采样概率 |
+| `nofilter_lightaug_v1` | full train + light visual augmentation | 4080 | 不做 filter，只测试轻量视觉增强 |
+
+### 12.2 关键结果
+
+| metric | no-filter | hard filter | weighted soft filter | light aug |
+| --- | ---: | ---: | ---: | ---: |
+| train loss last100 | 2.4378 | 2.6173 | 2.4999 | 2.4336 |
+| action top1 last100 | 0.3814 | 0.4266 | 0.3991 | 0.3508 |
+| ego used codes | 28 | 26 | 28 | 29 |
+| exo used codes | 31 | 27 | 32 | 28 |
+| ego self random-code gap | 0.03145 | 0.03407 | 0.03222 | 0.03030 |
+| ego swap random-code gap | 0.02906 | 0.03144 | 0.02982 | 0.02918 |
+| exo self random-code gap | 0.02761 | 0.02699 | 0.02715 | 0.02875 |
+| exo swap random-code gap | 0.02807 | 0.02742 | 0.02758 | 0.02901 |
+| view-invariance NMI sqrt | 0.06835 | 0.11191 | 0.06595 | 0.11225 |
+| view purity given token | 0.6803 | 0.7273 | 0.6734 | 0.7411 |
+
+### 12.3 解释
+
+hard filter 的问题不是“完全无效”，而是代价太大：它把 train takes 从 342 个压到 94 个、heldout takes 从 85 个压到 22 个，动作和任务多样性明显下降。它确实略微提高了 ego random-code causality gap 和 action top1，但 reconstruction loss 更差、code usage 下降、view-invariance 变差。对 FACT tokenizer 来说，这说明 hard filter 删除了噪声，也删除了 shared action codebook 需要的多样性。
+
+weighted soft filter 是更合理的方向：它使用完整 no-filter train mmap，只通过 take-level 权重降低 `loco_aux`、`diagnostic_candidate` 和 `discard` 的采样概率。结果显示它基本保住 code usage（ego/exo `28/32`），view-invariance 也略优于 no-filter（NMI `0.06595` vs `0.06835`），但 causality gap 只小幅变化，train loss 略差。这说明 soft filter 是安全的结构改进，但当前质量权重还不够强，不能单独带来显著收益。
+
+light augmentation 本轮不建议作为主线：train loss 最低，但 action top1 降到 `0.3508`，view-invariance 明显变差（NMI `0.11225`，purity `0.7411`）。它可能增强了 reconstruction robustness，但把 shared token 往 view-specific 外观差异上推，不符合当前 FACT tokenizer 的 shared action token 目标。
+
+### 12.4 当前结论
+
+1. 不建议继续使用 hard-filter-only 作为主训练数据。
+2. 保留 filter 方向，但从“删除数据”改为“质量加权采样 + 多样性保留”。
+3. 当前 soft filter v1 是比 hard filter 更安全的版本，但还没有形成足够收益，需要继续改权重和特征。
+4. 当前 light augmentation 不应优先推进，除非后续只作为很弱的辅助，并重新验证 view-invariance。
+5. 下一轮重点应放在数据侧 filter 本身：更好的人工标注覆盖、hand/object/contact proxy、exo pose/phase 特征、task diversity cap，而不是用 tokenizer 结果反向改标注。
+
+### 12.5 下一轮 filter 改进方向
+
+- 将 hard discard 限制在明确 scene-only、严重不同步、无 ego 可见操作、纯背景运动样本。
+- 对 `tokenizer_main` / `loco_aux` / `diagnostic_candidate` 使用连续权重，不直接硬切大部分数据。
+- 增加 per-task / per-parent-task diversity cap，避免只剩 cooking 和 bike repair。
+- 给 `loco_aux` 设置 capped sampling，而不是完全删除，因为 shared action token 仍需要身体阶段和空间运动变化。
+- 人工标注继续维持数据侧标准，不使用 tokenizer loss/probe 作为 ranker 标签。
+- 下一版验证优先跑：`nofilter_baseline` vs `weighted_soft_filter_v2`，全部使用同一个 no-filter heldout。
+
+### 12.6 weighted soft filter v2 实现记录
+
+已实现 `tools/build_take_weight_csv.py --preset v2`。v2 不再只按 bucket 给固定权重，而是组合以下数据侧信号：
+
+- ranker 概率：`ranker_prob_tokenizer_main`、`ranker_prob_loco_aux`、`ranker_prob_diagnostic_candidate`、`ranker_prob_discard`
+- 动作/交互质量：`interaction_score`、`object_motion_proxy`、`phase_diversity_score_v2`、`motion_state_change_score`
+- 风险抑制：`scene_only_score`、`prob_discard`、`ranker_disagreement_score`
+- 多样性修正：parent task / task count multiplier 与最终 weight mass balance multiplier
+
+生成结果：
+
+```bash
+OUT=outputs/filtering_v2_annotation_review_no_vlm
+
+conda run -n fact_tokenizer python tools/build_take_weight_csv.py \
+  --ranked $OUT/take_relevance_ranked_v2_all.csv \
+  --out $OUT/take_quality_weights_v2_train.csv \
+  --split train \
+  --preset v2
+```
+
+当前 v2 权重分布：
+
+| bucket | takes | positive takes | mean positive weight |
+| --- | ---: | ---: | ---: |
+| `tokenizer_main` | 94 | 94 | 0.5962 |
+| `loco_aux` | 105 | 105 | 0.1857 |
+| `diagnostic_candidate` | 93 | 93 | 0.1408 |
+| `discard` | 50 | 0 | 0.0000 |
+
+训练侧读取检查通过：`outputs/fact_tokenizer/nofilter_t1p0_train_by_take_npy_mmap` 的 342 个 train takes 全部匹配 `take_quality_weights_v2_train.csv`，其中 292 个正权重，mean positive weight 为 0.3036。
+
+注意：这只是 v2 filter 权重策略的代码和数据产物完成，不代表 v2 已经通过 tokenizer A/B。下一步需要从同一 v6b checkpoint 跑 `weighted_soft_filter_v2` 训练，并在同一个 no-filter heldout 上和 `nofilter_baseline` 对比。
+
+### 12.7 weighted soft filter v2 验证结果
+
+2026-07-09 已完成 v2 A/B 验证：
+
+- 训练 run：`outputs/fact_tokenizer/weighted_filter_v2_from_v6b_single_fg_20260709_132629`
+- probe run：`outputs/fact_tokenizer/weighted_filter_v2_from_v6b_single_fg_20260709_132629/probe_heldout_weighted_filter_v2_20260709_133340`
+- 训练设置：从同一 v6b checkpoint 继续 `90000 -> 90999`，1000 steps。
+- heldout：同一个 no-filter heldout mmap，`4080` samples。
+- 汇总文件已更新：
+  - `outputs/fact_tokenizer/ab_logs/filter_weight_aug_ab_20260708_summary.json`
+  - `outputs/fact_tokenizer/ab_logs/filter_weight_aug_ab_20260708_metrics.csv`
+
+关键对比：
+
+| metric | no-filter | weighted v1 | weighted v2 |
+| --- | ---: | ---: | ---: |
+| train loss last100 | 2.4378 | 2.4999 | 2.5686 |
+| action top1 last100 | 0.3814 | 0.3991 | 0.3983 |
+| ego used codes | 28 | 28 | 26 |
+| exo used codes | 31 | 32 | 31 |
+| ego self random-code gap | 0.03145 | 0.03222 | 0.03227 |
+| ego swap random-code gap | 0.02906 | 0.02982 | 0.03011 |
+| exo self random-code gap | 0.02761 | 0.02715 | 0.02794 |
+| exo swap random-code gap | 0.02807 | 0.02758 | 0.02837 |
+| view-invariance NMI sqrt | 0.06835 | 0.06595 | 0.07470 |
+| view purity given token | 0.6803 | 0.6734 | 0.6824 |
+| ego take leakage NMI | 0.3451 | 0.3402 | 0.3390 |
+| exo take leakage NMI | 0.3982 | 0.3980 | 0.3995 |
+
+结论：v2 不是一次明确成功的 filter 改进。它相对 no-filter 让 `action_top1` 从 `0.3814` 提到 `0.3983`，并让 random-code causality gap 有很小提升；但相比 weighted v1，`action_top1` 基本持平，train reconstruction loss 更差，ego used codes 从 `28` 降到 `26`，view-invariance NMI 从 `0.06595` 变差到 `0.07470`。因此，v2 说明“软加权比硬删除更安全”这个方向仍可保留，但当前权重公式并没有证明 filter 已经有效。
+
+下一步不建议继续只调 `bucket -> weight` 公式。更合理的改进是回到数据侧信号本身：
+
+- 增加更可靠的 hand/object/contact proxy，减少只靠 task/bucket/ranker probability 的弱监督。
+- 对 `diagnostic_candidate` 做细分：可学习的边界样本保留低权重，真正 scene-only 或同步差样本置零。
+- 对 cooking、bike repair 等高密度任务做 task-level cap，同时保留 phase diversity。
+- 增加少量 transition-level contact/phase 标注，用来训练 ranker 识别“同一 take 内哪些片段真正有交互”。
+- 下一轮验证应比较 `weighted_soft_filter_v1`、`weighted_soft_filter_v2`、`contact_proxy_filter_v3`，而不是继续和 hard-filter-only 对比。

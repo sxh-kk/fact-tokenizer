@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -24,6 +25,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=12)
     parser.add_argument("--thumb-size", type=int, default=112)
     parser.add_argument("--image-format", choices=["jpg", "png"], default="jpg")
+    parser.add_argument(
+        "--take-list-csv",
+        type=Path,
+        default=None,
+        help="Optional CSV containing take_uid values. If set, only these takes get contact sheets.",
+    )
+    parser.add_argument("--take-uid-column", default="take_uid")
+    parser.add_argument("--progress-every", type=int, default=25)
     return parser.parse_args()
 
 
@@ -73,6 +82,21 @@ def build_sheet(
     return sheet
 
 
+def load_requested_takes(path: Path | None, column: str) -> set[str] | None:
+    if path is None:
+        return None
+    requested: set[str] = set()
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if column not in (reader.fieldnames or []):
+            raise KeyError(f"{path} does not contain column {column!r}")
+        for row in reader:
+            take_uid = str(row.get(column, "")).strip()
+            if take_uid:
+                requested.add(take_uid)
+    return requested
+
+
 def main() -> None:
     args = parse_args()
     if args.num_frames <= 0:
@@ -80,12 +104,21 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     metadata = load_npz_metadata(args.npz)
     labels = load_labels_by_take(args.labels_jsonl)
+    requested_takes = load_requested_takes(args.take_list_csv, args.take_uid_column)
     grouped = group_indices_by_take(metadata["take_uid"])
+    if requested_takes is not None:
+        grouped = {take_uid: indices for take_uid, indices in grouped.items() if take_uid in requested_takes}
+        print(f"Generating contact sheets for {len(grouped)} requested takes from {args.take_list_csv}", flush=True)
+    else:
+        print(f"Generating contact sheets for all {len(grouped)} takes", flush=True)
+    print(f"Loading view arrays {args.view_keys} from {args.npz}", flush=True)
     with np.load(args.npz, allow_pickle=False) as data:
         views = {view_key: np.asarray(data[view_key]) for view_key in args.view_keys}
+    print("Loaded view arrays; writing contact sheets...", flush=True)
 
     rows = []
-    for take_uid, indices in sorted(grouped.items()):
+    total = len(grouped)
+    for take_index, (take_uid, indices) in enumerate(sorted(grouped.items()), 1):
         sampled = evenly_spaced_indices(indices, args.num_frames)
         label = labels.get(take_uid, {})
         sheet = build_sheet(
@@ -112,6 +145,8 @@ def main() -> None:
                 "take_name": label.get("take_name", ""),
             }
         )
+        if args.progress_every > 0 and (take_index % args.progress_every == 0 or take_index == total):
+            print(f"Saved {take_index}/{total} contact sheets", flush=True)
     write_csv(args.out / "contact_sheet_manifest.csv", rows)
     print(f"Saved {len(rows)} contact sheets to {args.out}")
 

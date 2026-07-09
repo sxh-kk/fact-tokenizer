@@ -10,6 +10,24 @@ fact_main:
   vlm_strong_main_prob: 0.78
   allow_vlm_override: true
 
+fact_main_variants:
+  strict:
+    min_tokenizer_main_prob: 0.68
+    min_hand_object_contact: 0.45
+    min_phase_diversity: 0.25
+    min_ego_hand_visibility: 0.30
+    max_scene_only: 0.34
+    max_discard_prob: 0.35
+    max_diagnostic_prob: 0.50
+  balanced:
+    min_tokenizer_main_prob: 0.55
+    min_hand_object_contact: 0.28
+    min_phase_diversity: 0.14
+    min_ego_hand_visibility: 0.22
+    max_scene_only: 0.47
+    max_discard_prob: 0.50
+    max_diagnostic_prob: 0.68
+
 loco_aux:
   min_loco_aux_prob: 0.58
   min_exo_body_visibility: 0.35

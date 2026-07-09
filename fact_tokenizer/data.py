@@ -74,13 +74,53 @@ def _resize_video(video: torch.Tensor, resize: Optional[int]) -> torch.Tensor:
     return resized.reshape(batch, frames, channels, resize, resize).contiguous()
 
 
-def _prepare_video_sample(array: np.ndarray, frame_pair: str, start_index: int, resize: Optional[int]) -> torch.Tensor:
+def _light_augment_video(video: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """Apply conservative per-transition augmentation without changing action timing."""
+    if video.ndim != 4:
+        raise ValueError(f"Expected a 4D video tensor, got shape {tuple(video.shape)}")
+    frames, channels, height, width = video.shape
+    if height >= 16 and width >= 16:
+        scale = float(torch.empty(()).uniform_(0.92, 1.0, generator=generator).item())
+        crop_h = max(1, min(height, int(round(height * scale))))
+        crop_w = max(1, min(width, int(round(width * scale))))
+        top = int(torch.randint(0, height - crop_h + 1, (1,), generator=generator).item())
+        left = int(torch.randint(0, width - crop_w + 1, (1,), generator=generator).item())
+        video = video[:, :, top : top + crop_h, left : left + crop_w]
+        video = F.interpolate(
+            video.reshape(frames, channels, crop_h, crop_w),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+    brightness = float(torch.empty(()).uniform_(0.90, 1.10, generator=generator).item())
+    contrast = float(torch.empty(()).uniform_(0.90, 1.10, generator=generator).item())
+    mean = video.mean(dim=(-2, -1), keepdim=True)
+    video = (video - mean) * contrast + mean
+    video = video * brightness
+    if float(torch.rand((), generator=generator).item()) < 0.25:
+        noise_std = float(torch.empty(()).uniform_(0.0, 0.015, generator=generator).item())
+        video = video + torch.randn(video.shape, generator=generator, dtype=video.dtype) * noise_std
+    return video.clamp_(0.0, 1.0).contiguous()
+
+
+def _prepare_video_sample(
+    array: np.ndarray,
+    frame_pair: str,
+    start_index: int,
+    resize: Optional[int],
+    augment: bool = False,
+    augment_seed: int = 0,
+) -> torch.Tensor:
     if array.ndim != 4:
         raise ValueError(f"Expected a 4D per-sample array, got shape {array.shape}")
     video = _to_float_chw(np.asarray(array).copy()[None])
     video = _select_transition(video, frame_pair, start_index)
     video = _resize_video(video, resize)
-    return video[0].contiguous()
+    sample = video[0].contiguous()
+    if augment:
+        generator = torch.Generator().manual_seed(int(augment_seed))
+        sample = _light_augment_video(sample, generator)
+    return sample
 
 
 class FACTPairedNPYDataset(Dataset):
@@ -94,6 +134,8 @@ class FACTPairedNPYDataset(Dataset):
         frame_pair: str = "first-last",
         start_index: int = 0,
         resize: Optional[int] = 224,
+        augment: bool = False,
+        augment_seed: int = 0,
     ) -> None:
         self.input_dir = Path(input_dir)
         self.output_view_names = list(output_view_names)
@@ -107,6 +149,8 @@ class FACTPairedNPYDataset(Dataset):
         self.frame_pair = frame_pair
         self.start_index = start_index
         self.resize = resize
+        self.augment = bool(augment)
+        self.augment_seed = int(augment_seed)
         self._videos = {
             output_name: np.load(self.input_dir / f"{source_name}.npy", mmap_mode="r")
             for output_name, source_name in zip(self.output_view_names, self.source_view_keys)
@@ -118,6 +162,7 @@ class FACTPairedNPYDataset(Dataset):
 
         take_uid_path = self.input_dir / "take_uid.npy"
         timestamp_path = self.input_dir / "timestamp.npy"
+        sample_id_path = self.input_dir / "sample_id.npy"
         if take_uid_path.exists():
             take_uid = np.load(take_uid_path, mmap_mode="r").astype(str)
             if len(take_uid) != self._num_samples:
@@ -136,6 +181,14 @@ class FACTPairedNPYDataset(Dataset):
             self.timestamps = torch.from_numpy(np.asarray(timestamp, dtype=np.float32))
         else:
             self.timestamps = torch.arange(self._num_samples, dtype=torch.float32)
+
+        if sample_id_path.exists():
+            sample_id = np.load(sample_id_path, mmap_mode="r").astype(str)
+            if len(sample_id) != self._num_samples:
+                raise ValueError(f"sample_id has length {len(sample_id)}, expected {self._num_samples}")
+            self.sample_ids = sample_id.tolist()
+        else:
+            self.sample_ids = [str(index) for index in range(self._num_samples)]
 
     def _infer_view_keys(self) -> list[str]:
         preferred = [key for key in ("ego", "exo", "primary", "wrist") if (self.input_dir / f"{key}.npy").exists()]
@@ -157,12 +210,17 @@ class FACTPairedNPYDataset(Dataset):
                     self.frame_pair,
                     self.start_index,
                     self.resize,
+                    augment=self.augment,
+                    augment_seed=self.augment_seed
+                    + int(index) * 1009
+                    + view_offset * 9176
+                    + int(torch.randint(0, 2**20, (1,)).item()),
                 ),
                 "sample_id": torch.tensor(index, dtype=torch.long),
                 "take_index": self.take_indices[index],
                 "timestamp": self.timestamps[index],
             }
-            for view_name in self.output_view_names
+            for view_offset, view_name in enumerate(self.output_view_names)
         }
 
 
@@ -183,6 +241,8 @@ class FACTPairedNPZDataset(Dataset):
         frame_pair: str = "first-last",
         start_index: int = 0,
         resize: Optional[int] = 224,
+        augment: bool = False,
+        augment_seed: int = 0,
     ) -> None:
         self.input_npz = Path(input_npz)
         if self.input_npz.is_dir():
@@ -193,6 +253,8 @@ class FACTPairedNPZDataset(Dataset):
                 frame_pair=frame_pair,
                 start_index=start_index,
                 resize=resize,
+                augment=augment,
+                augment_seed=augment_seed,
             )
             self.output_view_names = self._delegate.output_view_names
             self.source_view_keys = self._delegate.source_view_keys
@@ -201,6 +263,9 @@ class FACTPairedNPZDataset(Dataset):
             self.take_uids = self._delegate.take_uids
             self.take_indices = self._delegate.take_indices
             self.timestamps = self._delegate.timestamps
+            self.sample_ids = self._delegate.sample_ids
+            self.augment = bool(augment)
+            self.augment_seed = int(augment_seed)
             return
         self._delegate = None
         self.output_view_names = list(output_view_names)
@@ -213,6 +278,7 @@ class FACTPairedNPZDataset(Dataset):
             arrays = self._load_arrays(data, source_view_keys, videos_layout)
             take_uid = np.asarray(data["take_uid"]).astype(str) if "take_uid" in data else None
             timestamp = np.asarray(data["timestamp"], dtype=np.float32) if "timestamp" in data else None
+            sample_id = np.asarray(data["sample_id"]).astype(str) if "sample_id" in data else None
 
         if len(arrays) < 2:
             raise ValueError("FACTPairedNPZDataset needs two synchronized views")
@@ -232,6 +298,8 @@ class FACTPairedNPZDataset(Dataset):
         self.source_view_keys = list(arrays.keys())[:2]
         self.frame_pair = frame_pair
         self.resize = resize
+        self.augment = bool(augment)
+        self.augment_seed = int(augment_seed)
         num_samples = len(self)
         if take_uid is not None:
             if len(take_uid) != num_samples:
@@ -248,6 +316,12 @@ class FACTPairedNPZDataset(Dataset):
             self.timestamps = torch.from_numpy(timestamp.astype(np.float32))
         else:
             self.timestamps = torch.arange(num_samples, dtype=torch.float32)
+        if sample_id is not None:
+            if len(sample_id) != num_samples:
+                raise ValueError(f"sample_id has length {len(sample_id)}, expected {num_samples}")
+            self.sample_ids = sample_id.tolist()
+        else:
+            self.sample_ids = [str(index) for index in range(num_samples)]
 
     def _load_arrays(
         self,
@@ -284,10 +358,20 @@ class FACTPairedNPZDataset(Dataset):
             return self._delegate[index]
         return {
             view_name: {
-                "videos": self.videos[view_name][index],
+                "videos": _light_augment_video(
+                    self.videos[view_name][index],
+                    torch.Generator().manual_seed(
+                        self.augment_seed
+                        + int(index) * 1009
+                        + view_offset * 9176
+                        + int(torch.randint(0, 2**20, (1,)).item())
+                    ),
+                )
+                if self.augment
+                else self.videos[view_name][index],
                 "sample_id": torch.tensor(index, dtype=torch.long),
                 "take_index": self.take_indices[index],
                 "timestamp": self.timestamps[index],
             }
-            for view_name in self.output_view_names
+            for view_offset, view_name in enumerate(self.output_view_names)
         }

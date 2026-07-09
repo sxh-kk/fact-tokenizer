@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--materialize-npz", action="store_true", default=True)
     parser.add_argument("--skip-materialize-npz", dest="materialize_npz", action="store_false")
     parser.add_argument("--fact-main-only-dirname", default="fact_main")
+    parser.add_argument("--fact-main-strict-dirname", default="fact_main_strict")
+    parser.add_argument("--fact-main-balanced-dirname", default="fact_main_balanced")
     parser.add_argument("--fact-main-plus-loco-dirname", default="fact_main_plus_loco25")
     parser.add_argument("--num-transitions", type=int, default=48)
     parser.add_argument("--loco-transitions", type=int, default=12)
@@ -228,7 +230,39 @@ def main() -> None:
 
     filtered_split = args.out_dir / "filtered_split_v2.json"
     run([args.python, "tools/build_filtered_split.py", "--ranked", str(all_scores), "--policy", str(args.policy), "--out", str(filtered_split)])
+    strict_split = args.out_dir / "filtered_split_v2_fact_main_strict.json"
+    run(
+        [
+            args.python,
+            "tools/build_filtered_split.py",
+            "--ranked",
+            str(all_scores),
+            "--policy",
+            str(args.policy),
+            "--fact-main-mode",
+            "strict",
+            "--out",
+            str(strict_split),
+        ]
+    )
+    balanced_split = args.out_dir / "filtered_split_v2_fact_main_balanced.json"
+    run(
+        [
+            args.python,
+            "tools/build_filtered_split.py",
+            "--ranked",
+            str(all_scores),
+            "--policy",
+            str(args.policy),
+            "--fact-main-mode",
+            "balanced",
+            "--out",
+            str(balanced_split),
+        ]
+    )
     run([args.python, "tools/audit_filtered_split.py", "--filtered-split", str(filtered_split), "--out", str(args.out_dir / "audit_report_v2.md")])
+    run([args.python, "tools/audit_filtered_split.py", "--filtered-split", str(strict_split), "--out", str(args.out_dir / "audit_report_v2_fact_main_strict.md")])
+    run([args.python, "tools/audit_filtered_split.py", "--filtered-split", str(balanced_split), "--out", str(args.out_dir / "audit_report_v2_fact_main_balanced.md")])
 
     labels = [str(args.base_split_dir / "train_labels.jsonl"), str(args.base_split_dir / "heldout_labels.jsonl")]
     run(
@@ -245,9 +279,39 @@ def main() -> None:
             str(args.out_dir / "selected_takes_filtering_v2_fact_main.jsonl"),
         ]
     )
+    run(
+        [
+            args.python,
+            "tools/export_filtered_selected_takes.py",
+            "--filtered-split",
+            str(strict_split),
+            "--labels-jsonl",
+            *labels,
+            "--include-buckets",
+            "fact_main",
+            "--out",
+            str(args.out_dir / "selected_takes_filtering_v2_fact_main_strict.jsonl"),
+        ]
+    )
+    run(
+        [
+            args.python,
+            "tools/export_filtered_selected_takes.py",
+            "--filtered-split",
+            str(balanced_split),
+            "--labels-jsonl",
+            *labels,
+            "--include-buckets",
+            "fact_main",
+            "--out",
+            str(args.out_dir / "selected_takes_filtering_v2_fact_main_balanced.jsonl"),
+        ]
+    )
 
     if args.materialize_npz:
         materialize_filtered_npz(args, filtered_split, ["fact_main"], args.out_dir / "filtered_npz" / args.fact_main_only_dirname)
+        materialize_filtered_npz(args, strict_split, ["fact_main"], args.out_dir / "filtered_npz" / args.fact_main_strict_dirname)
+        materialize_filtered_npz(args, balanced_split, ["fact_main"], args.out_dir / "filtered_npz" / args.fact_main_balanced_dirname)
         materialize_filtered_npz(
             args,
             filtered_split,
@@ -258,6 +322,8 @@ def main() -> None:
     print("")
     print(f"Minimal filtering_v2 artifacts written under {args.out_dir}")
     print(f"Filtered split: {filtered_split}")
+    print(f"Strict split: {strict_split}")
+    print(f"Balanced split: {balanced_split}")
     print(f"Review CSV: {review_csv}")
 
 

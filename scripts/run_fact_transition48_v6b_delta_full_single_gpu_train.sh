@@ -4,27 +4,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
-export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
-export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-0}"
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
-export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
-export FACT_DDP_TIMEOUT_SEC="${FACT_DDP_TIMEOUT_SEC:-3600}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 
-TORCHRUN="${TORCHRUN:-/home/sxh/.conda/envs/fact_tokenizer/bin/torchrun}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-RUN_NAME="${RUN_NAME:-v6b_transition48_delta_full_from_v5p_8gpu_$(date +%Y%m%d_%H%M%S)}"
+PYTHON="${PYTHON:-/home/sxh/.conda/envs/fact_tokenizer/bin/python}"
+RUN_NAME="${RUN_NAME:-v6b_transition48_delta_full_single_gpu_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/fact_tokenizer/${RUN_NAME}}"
-TRAIN_NPZ="${TRAIN_NPZ:-data/fact_egoexo/splits/diverse_500takes_t0p5_s1_48t_seed123_80_20/train_by_take.npz}"
-RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-outputs/fact_tokenizer/v5p_transition48_from_v5m_randomcode_take_repair_4gpu_tmux/fact_tokenizer.ckpt}"
-
-# v5p final checkpoint is step 83999; 90000 runs about 6000 additional steps.
-STEPS="${STEPS:-90000}"
+TRAIN_NPZ="${TRAIN_NPZ:-outputs/fact_tokenizer/nofilter_t1p0_train_by_take_npy_mmap}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-outputs/fact_tokenizer/v6b_transition48_delta_full_from_v5p_8gpu_20260620_2200/fact_tokenizer.ckpt}"
+STEPS="${STEPS:-91000}"
 PER_GPU_BATCH="${PER_GPU_BATCH:-16}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
-PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 TAKE_WEIGHT_CSV="${TAKE_WEIGHT_CSV:-}"
 TRANSITION_WEIGHT_CSV="${TRANSITION_WEIGHT_CSV:-}"
 LIGHT_AUGMENT="${LIGHT_AUGMENT:-0}"
@@ -39,11 +30,9 @@ if [[ ! -f "$RESUME_CHECKPOINT" ]]; then
 fi
 
 CMD=(
-  "$TORCHRUN"
-  --standalone
-  --nproc_per_node="$NPROC_PER_NODE"
+  "$PYTHON"
+  -u
   scripts/train_fact_npz_debug.py
-  --ddp
   --input-npz "$TRAIN_NPZ"
   --output-dir "$OUTPUT_DIR"
   --source-view-keys ego exo

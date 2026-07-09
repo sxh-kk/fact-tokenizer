@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -37,16 +38,46 @@ def load_labels_by_take(path: Path | str | None) -> dict[str, dict[str, Any]]:
 
 def load_npz_metadata(path: Path | str) -> dict[str, np.ndarray]:
     path = Path(path)
-    with np.load(path, allow_pickle=False) as data:
-        first_view = next((key for key in VIEW_KEYS if key in data), None)
+    if path.is_dir():
+        take_uid_path = path / "take_uid.npy"
+        sample_id_path = path / "sample_id.npy"
+        timestamp_path = path / "timestamp.npy"
+        first_view = next((key for key in VIEW_KEYS if (path / f"{key}.npy").exists()), None)
         if first_view is None:
-            first_view = next(key for key, value in data.items() if getattr(value, "ndim", 0) >= 1)
-        num_rows = int(data[first_view].shape[0])
+            first_view = next(p.stem for p in sorted(path.glob("*.npy")))
+        num_rows = int(np.load(path / f"{first_view}.npy", mmap_mode="r").shape[0])
+        take_uid = (
+            np.load(take_uid_path, mmap_mode="r").astype(str)
+            if take_uid_path.exists()
+            else np.asarray([str(index) for index in range(num_rows)])
+        )
+        timestamp = (
+            np.load(timestamp_path, mmap_mode="r").astype(np.float32)
+            if timestamp_path.exists()
+            else np.arange(num_rows, dtype=np.float32)
+        )
+        sample_id = (
+            np.load(sample_id_path, mmap_mode="r").astype(str)
+            if sample_id_path.exists()
+            else np.asarray([str(index) for index in range(num_rows)])
+        )
+        if len(take_uid) != num_rows or len(timestamp) != num_rows or len(sample_id) != num_rows:
+            raise ValueError(f"Metadata arrays in {path} do not match view length {num_rows}")
+        return {"take_uid": take_uid, "timestamp": timestamp, "sample_id": sample_id}
+    with np.load(path, allow_pickle=False) as data:
         take_uid = (
             np.asarray(data["take_uid"]).astype(str)
             if "take_uid" in data
-            else np.asarray([str(index) for index in range(num_rows)])
+            else None
         )
+        if take_uid is not None:
+            num_rows = len(take_uid)
+        else:
+            first_view = next((key for key in VIEW_KEYS if key in data), None)
+            if first_view is None:
+                first_view = next(iter(data.files))
+            num_rows = int(npz_array_shape(path, first_view)[0])
+            take_uid = np.asarray([str(index) for index in range(num_rows)])
         timestamp = (
             np.asarray(data["timestamp"], dtype=np.float32)
             if "timestamp" in data
@@ -60,6 +91,22 @@ def load_npz_metadata(path: Path | str) -> dict[str, np.ndarray]:
     if len(take_uid) != num_rows or len(timestamp) != num_rows or len(sample_id) != num_rows:
         raise ValueError(f"Metadata arrays in {path} do not match view length {num_rows}")
     return {"take_uid": take_uid, "timestamp": timestamp, "sample_id": sample_id}
+
+
+def npz_array_shape(path: Path | str, key: str) -> tuple[int, ...]:
+    """Read an array shape from a .npz member header without loading data."""
+    path = Path(path)
+    member = f"{key}.npy"
+    with zipfile.ZipFile(path) as archive:
+        with archive.open(member) as handle:
+            version = np.lib.format.read_magic(handle)
+            if version == (1, 0):
+                shape, _fortran, _dtype = np.lib.format.read_array_header_1_0(handle)
+            elif version == (2, 0):
+                shape, _fortran, _dtype = np.lib.format.read_array_header_2_0(handle)
+            else:
+                shape, _fortran, _dtype = np.lib.format._read_array_header(handle, version)
+    return tuple(int(value) for value in shape)
 
 
 def group_indices_by_take(take_uid: Iterable[str]) -> dict[str, list[int]]:

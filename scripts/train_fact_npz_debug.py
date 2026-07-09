@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import itertools
 import json
 import os
@@ -54,6 +55,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--take-grouped-batches", action="store_true")
     parser.add_argument("--samples-per-take", type=int, default=4)
+    parser.add_argument("--take-weight-csv", type=Path, default=None)
+    parser.add_argument(
+        "--take-weight-column",
+        default="sample_weight",
+        help="Column in --take-weight-csv used for take-level sampling weights.",
+    )
+    parser.add_argument("--take-weight-uid-column", default="take_uid")
+    parser.add_argument("--min-take-sampling-weight", type=float, default=0.0)
+    parser.add_argument("--transition-weight-csv", type=Path, default=None)
+    parser.add_argument(
+        "--transition-weight-column",
+        default="transition_weight",
+        help="Column in --transition-weight-csv used for per-transition sampling weights.",
+    )
+    parser.add_argument("--transition-weight-sample-id-column", default="sample_id")
+    parser.add_argument("--transition-weight-row-index-column", default="row_index")
+    parser.add_argument("--transition-weight-take-uid-column", default="take_uid")
+    parser.add_argument("--transition-weight-timestamp-column", default="timestamp")
+    parser.add_argument("--transition-weight-timestamp-tolerance", type=float, default=1e-3)
+    parser.add_argument("--min-transition-sampling-weight", type=float, default=0.0)
+    parser.add_argument("--light-augment", action="store_true")
     parser.add_argument("--mined-negative-map", type=Path, default=None)
     parser.add_argument("--mined-negative-top-k", type=int, default=4)
     parser.add_argument("--mined-pair-batches", action="store_true")
@@ -225,6 +247,8 @@ class TakeGroupedBatchSampler(Sampler[list[int]]):
         rank: int,
         world_size: int,
         seed: int,
+        take_sampling_weights: Optional[torch.Tensor] = None,
+        sample_sampling_weights: Optional[torch.Tensor] = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -239,10 +263,24 @@ class TakeGroupedBatchSampler(Sampler[list[int]]):
         self.epoch = 0
         self.batches_per_epoch = max(1, (len(take_indices) + self.batch_size * self.world_size - 1) // (self.batch_size * self.world_size))
         self.take_to_indices: dict[int, torch.Tensor] = {}
+        self.take_to_member_weights: dict[int, Optional[torch.Tensor]] = {}
         for take in torch.unique(take_indices).tolist():
             members = torch.nonzero(take_indices == int(take), as_tuple=False).flatten()
             self.take_to_indices[int(take)] = members
+            if sample_sampling_weights is not None:
+                weights = sample_sampling_weights[members].float().clamp_min(0.0)
+                if float(weights.sum().item()) > 0.0:
+                    self.take_to_member_weights[int(take)] = weights / weights.sum()
+                else:
+                    self.take_to_member_weights[int(take)] = None
         self.take_ids = torch.tensor(sorted(self.take_to_indices), dtype=torch.long)
+        if take_sampling_weights is None:
+            self.take_sampling_weights = None
+        else:
+            weights = take_sampling_weights[self.take_ids].float().clamp_min(0.0)
+            if float(weights.sum()) <= 0.0:
+                raise ValueError("take_sampling_weights must contain at least one positive weight")
+            self.take_sampling_weights = weights / weights.sum()
 
     def __len__(self) -> int:
         return self.batches_per_epoch
@@ -253,11 +291,29 @@ class TakeGroupedBatchSampler(Sampler[list[int]]):
     def __iter__(self) -> Iterator[list[int]]:
         generator = torch.Generator().manual_seed(self.seed + self.epoch * 1009 + self.rank)
         for _ in range(self.batches_per_epoch):
-            selected = self.take_ids[torch.randint(len(self.take_ids), (self.takes_per_batch,), generator=generator)]
+            if self.take_sampling_weights is None:
+                selected = self.take_ids[torch.randint(len(self.take_ids), (self.takes_per_batch,), generator=generator)]
+            else:
+                selected_offsets = torch.multinomial(
+                    self.take_sampling_weights,
+                    self.takes_per_batch,
+                    replacement=True,
+                    generator=generator,
+                )
+                selected = self.take_ids[selected_offsets]
             batch: list[int] = []
             for take in selected.tolist():
                 members = self.take_to_indices[int(take)]
-                choices = torch.randint(len(members), (self.samples_per_take,), generator=generator)
+                member_weights = self.take_to_member_weights.get(int(take))
+                if member_weights is None:
+                    choices = torch.randint(len(members), (self.samples_per_take,), generator=generator)
+                else:
+                    choices = torch.multinomial(
+                        member_weights,
+                        self.samples_per_take,
+                        replacement=True,
+                        generator=generator,
+                    )
                 batch.extend(int(index) for index in members[choices].tolist())
             yield batch
 
@@ -348,6 +404,160 @@ def load_mined_negative_map(path: Optional[Path], expected_len: int, top_k: int)
     return torch.from_numpy(donor_indices), torch.from_numpy(donor_scores)
 
 
+def load_take_sampling_weights(
+    path: Optional[Path],
+    take_uids: list[str],
+    take_indices: torch.Tensor,
+    weight_column: str,
+    uid_column: str,
+    min_weight: float,
+) -> tuple[Optional[torch.Tensor], dict]:
+    if path is None:
+        return None, {}
+    weights_by_uid: dict[str, float] = {}
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"{path} is empty")
+        missing = [name for name in (uid_column, weight_column) if name not in reader.fieldnames]
+        if missing:
+            raise KeyError(f"{path} is missing columns: {missing}")
+        for row in reader:
+            uid = str(row.get(uid_column, "")).strip()
+            if not uid:
+                continue
+            try:
+                weight = float(row.get(weight_column, "0") or 0.0)
+            except ValueError:
+                weight = 0.0
+            weights_by_uid[uid] = max(float(min_weight), weight)
+    num_takes = int(take_indices.max().item()) + 1 if take_indices.numel() else 0
+    take_weights = torch.zeros(num_takes, dtype=torch.float32)
+    take_index_by_uid: dict[str, int] = {}
+    for uid, take_index in zip(take_uids, take_indices.tolist()):
+        take_index_by_uid.setdefault(str(uid), int(take_index))
+    matched = 0
+    for uid, take_index in take_index_by_uid.items():
+        if uid in weights_by_uid:
+            take_weights[int(take_index)] = float(weights_by_uid[uid])
+            matched += 1
+    if matched == 0:
+        raise ValueError(f"No take_uid values from dataset matched {path}")
+    positive = int((take_weights > 0).sum().item())
+    if positive == 0:
+        raise ValueError(f"{path} produced zero positive take sampling weights")
+    return take_weights, {
+        "path": str(path),
+        "weight_column": weight_column,
+        "uid_column": uid_column,
+        "matched_takes": matched,
+        "positive_takes": positive,
+        "total_takes": len(take_index_by_uid),
+        "mean_positive_weight": float(take_weights[take_weights > 0].mean().item()),
+    }
+
+
+def _metadata_key(take_uid: str, timestamp: float, tolerance: float) -> tuple[str, int]:
+    if tolerance <= 0:
+        return (str(take_uid), int(round(float(timestamp) * 1_000_000)))
+    return (str(take_uid), int(round(float(timestamp) / float(tolerance))))
+
+
+def load_transition_sampling_weights(
+    path: Optional[Path],
+    sample_ids: list[str],
+    take_uids: list[str],
+    timestamps: torch.Tensor,
+    weight_column: str,
+    sample_id_column: str,
+    row_index_column: str,
+    take_uid_column: str,
+    timestamp_column: str,
+    timestamp_tolerance: float,
+    min_weight: float,
+) -> tuple[Optional[torch.Tensor], dict]:
+    if path is None:
+        return None, {}
+    num_samples = len(sample_ids)
+    weights = torch.zeros(num_samples, dtype=torch.float32)
+    sample_id_to_index = {str(sample_id): index for index, sample_id in enumerate(sample_ids)}
+    metadata_to_index = {
+        _metadata_key(take_uid, float(timestamp), timestamp_tolerance): index
+        for index, (take_uid, timestamp) in enumerate(zip(take_uids, timestamps.tolist()))
+    }
+    matched = 0
+    duplicate_matches = 0
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"{path} is empty")
+        if weight_column not in reader.fieldnames:
+            raise KeyError(f"{path} is missing transition weight column {weight_column!r}")
+        for row in reader:
+            try:
+                weight = float(row.get(weight_column, "0") or 0.0)
+            except ValueError:
+                weight = 0.0
+            weight = max(float(min_weight), weight)
+            index: Optional[int] = None
+            sample_id = str(row.get(sample_id_column, "")).strip() if sample_id_column in reader.fieldnames else ""
+            if sample_id:
+                index = sample_id_to_index.get(sample_id)
+            if index is None and row_index_column in reader.fieldnames:
+                row_index = str(row.get(row_index_column, "")).strip()
+                if row_index:
+                    try:
+                        candidate = int(row_index)
+                    except ValueError:
+                        candidate = -1
+                    if 0 <= candidate < num_samples:
+                        index = candidate
+            if index is None and take_uid_column in reader.fieldnames and timestamp_column in reader.fieldnames:
+                take_uid = str(row.get(take_uid_column, "")).strip()
+                timestamp_text = str(row.get(timestamp_column, "")).strip()
+                if take_uid and timestamp_text:
+                    try:
+                        key = _metadata_key(take_uid, float(timestamp_text), timestamp_tolerance)
+                    except ValueError:
+                        key = ("", 0)
+                    index = metadata_to_index.get(key)
+            if index is None:
+                continue
+            if float(weights[index].item()) > 0.0:
+                duplicate_matches += 1
+            weights[index] = float(weight)
+            matched += 1
+    if matched == 0:
+        raise ValueError(f"No transition rows from dataset matched {path}")
+    positive = int((weights > 0).sum().item())
+    if positive == 0:
+        raise ValueError(f"{path} produced zero positive transition sampling weights")
+    return weights, {
+        "path": str(path),
+        "weight_column": weight_column,
+        "sample_id_column": sample_id_column,
+        "row_index_column": row_index_column,
+        "take_uid_column": take_uid_column,
+        "timestamp_column": timestamp_column,
+        "timestamp_tolerance": float(timestamp_tolerance),
+        "matched_rows": int(matched),
+        "duplicate_matches": int(duplicate_matches),
+        "positive_transitions": positive,
+        "total_transitions": num_samples,
+        "mean_positive_weight": float(weights[weights > 0].mean().item()),
+    }
+
+
+def derive_take_weights_from_transition_weights(
+    take_indices: torch.Tensor,
+    transition_weights: torch.Tensor,
+) -> torch.Tensor:
+    num_takes = int(take_indices.max().item()) + 1 if take_indices.numel() else 0
+    take_weights = torch.zeros(num_takes, dtype=torch.float32)
+    take_weights.scatter_add_(0, take_indices.long(), transition_weights.float().clamp_min(0.0))
+    return take_weights
+
+
 def attach_mined_negative_batch_fields(
     batch: Dict[str, Dict[str, torch.Tensor]],
     view_names: list[str],
@@ -405,7 +615,47 @@ def main() -> None:
         frame_pair=args.frame_pair,
         start_index=args.start_index,
         resize=args.resize,
+        augment=args.light_augment,
+        augment_seed=args.seed + rank * 100003,
     )
+    take_sampling_weights, take_weight_metadata = load_take_sampling_weights(
+        args.take_weight_csv,
+        dataset.take_uids,
+        dataset.take_indices,
+        args.take_weight_column,
+        args.take_weight_uid_column,
+        args.min_take_sampling_weight,
+    )
+    transition_sampling_weights, transition_weight_metadata = load_transition_sampling_weights(
+        args.transition_weight_csv,
+        dataset.sample_ids,
+        dataset.take_uids,
+        dataset.timestamps,
+        args.transition_weight_column,
+        args.transition_weight_sample_id_column,
+        args.transition_weight_row_index_column,
+        args.transition_weight_take_uid_column,
+        args.transition_weight_timestamp_column,
+        args.transition_weight_timestamp_tolerance,
+        args.min_transition_sampling_weight,
+    )
+    if transition_sampling_weights is not None:
+        positive_take_weights = derive_take_weights_from_transition_weights(dataset.take_indices, transition_sampling_weights)
+        if take_sampling_weights is None:
+            take_sampling_weights = positive_take_weights
+            take_weight_metadata = {
+                "derived_from_transition_weight_csv": str(args.transition_weight_csv),
+                "positive_takes": int((take_sampling_weights > 0).sum().item()),
+                "total_takes": int(take_sampling_weights.numel()),
+                "mean_positive_weight": float(take_sampling_weights[take_sampling_weights > 0].mean().item()),
+            }
+        else:
+            take_sampling_weights = take_sampling_weights.float().clone()
+            take_sampling_weights[positive_take_weights <= 0] = 0.0
+            if int((take_sampling_weights > 0).sum().item()) == 0:
+                raise ValueError("Combining take and transition weights left zero positive takes")
+            take_weight_metadata = dict(take_weight_metadata)
+            take_weight_metadata["zeroed_takes_without_positive_transitions"] = int((positive_take_weights <= 0).sum().item())
     mined_donor_indices, mined_donor_scores = load_mined_negative_map(
         args.mined_negative_map,
         expected_len=len(dataset),
@@ -415,6 +665,10 @@ def main() -> None:
         raise ValueError("--mined-pair-batches requires --mined-negative-map")
     if args.mined_pair_batches and args.take_grouped_batches:
         raise ValueError("--mined-pair-batches and --take-grouped-batches are mutually exclusive")
+    if args.take_weight_csv is not None and not args.take_grouped_batches:
+        raise ValueError("--take-weight-csv currently requires --take-grouped-batches")
+    if args.transition_weight_csv is not None and not args.take_grouped_batches:
+        raise ValueError("--transition-weight-csv currently requires --take-grouped-batches")
     batch_sampler = None
     sampler = None
     if args.mined_pair_batches:
@@ -434,6 +688,8 @@ def main() -> None:
             rank=rank,
             world_size=world_size,
             seed=args.seed,
+            take_sampling_weights=take_sampling_weights,
+            sample_sampling_weights=transition_sampling_weights,
         )
     elif distributed:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -665,6 +921,9 @@ def main() -> None:
                     "optimizer_state": optimizer.state_dict(),
                     "step": step,
                     "mined_negative_map": str(args.mined_negative_map) if args.mined_negative_map else None,
+                    "take_weight_csv": str(args.take_weight_csv) if args.take_weight_csv else None,
+                    "transition_weight_csv": str(args.transition_weight_csv) if args.transition_weight_csv else None,
+                    "light_augment": bool(args.light_augment),
                 },
                 args.output_dir / f"fact_tokenizer_step_{step + 1:06d}.ckpt",
             )
@@ -699,6 +958,9 @@ def main() -> None:
             "optimizer_state": optimizer.state_dict(),
             "step": args.steps - 1,
             "mined_negative_map": str(args.mined_negative_map) if args.mined_negative_map else None,
+            "take_weight_csv": str(args.take_weight_csv) if args.take_weight_csv else None,
+            "transition_weight_csv": str(args.transition_weight_csv) if args.transition_weight_csv else None,
+            "light_augment": bool(args.light_augment),
         },
         checkpoint_path,
     )
@@ -716,6 +978,9 @@ def main() -> None:
             "mined_negative_map": str(args.mined_negative_map) if args.mined_negative_map else None,
             "mined_negative_top_k": args.mined_negative_top_k if args.mined_negative_map else None,
             "mined_pair_batches": bool(args.mined_pair_batches),
+            "take_weight_metadata": take_weight_metadata,
+            "transition_weight_metadata": transition_weight_metadata,
+            "light_augment": bool(args.light_augment),
         },
     )
     print(f"Saved FACT tokenizer checkpoint to {checkpoint_path}")

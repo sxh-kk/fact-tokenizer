@@ -22,6 +22,8 @@ VALID_VALUES = {
     "exo_body_visibility": {"0", "1", "2"},
     "object_interaction": {"0", "1", "2"},
     "phase_diversity": {"0", "1", "2"},
+    "scene_only_risk": {"0", "1", "2"},
+    "ego_exo_sync_quality": {"ok", "minor_issue", "bad"},
     "usable_for": {"tokenizer_main", "loco_aux", "discard", "diagnostic_candidate"},
 }
 
@@ -52,10 +54,16 @@ def validate_row(row: dict[str, str], row_number: int, allow_empty: bool) -> lis
     exo_body = str(row.get("exo_body_visibility", "")).strip()
     object_interaction = str(row.get("object_interaction", "")).strip()
     phase_diversity = str(row.get("phase_diversity", "")).strip()
+    scene_only = str(row.get("scene_only_risk", "")).strip()
+    sync = str(row.get("ego_exo_sync_quality", "")).strip()
     if usable_for == "tokenizer_main" and relevance != "A_interaction_rich":
         errors.append(f"row {row_number}: tokenizer_main conflicts with take_relevance={relevance!r}")
     if usable_for == "tokenizer_main" and ego_hand == "0" and object_interaction == "0":
         errors.append(f"row {row_number}: tokenizer_main requires hand or object interaction signal")
+    if usable_for == "tokenizer_main" and scene_only == "2":
+        errors.append(f"row {row_number}: tokenizer_main cannot have high scene_only_risk")
+    if usable_for == "tokenizer_main" and sync == "bad":
+        errors.append(f"row {row_number}: tokenizer_main cannot have bad ego_exo_sync_quality")
     if usable_for == "loco_aux" and exo_body == "0" and phase_diversity == "0":
         errors.append(f"row {row_number}: loco_aux requires exo body visibility or phase diversity")
     if relevance == "D_scene_only" and usable_for in {"tokenizer_main", "loco_aux"}:

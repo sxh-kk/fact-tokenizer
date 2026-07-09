@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--view-keys", nargs=2, default=["ego", "exo"])
     parser.add_argument("--sample-transitions-per-take", type=int, default=16)
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Do not read video arrays. Use labels/task priors only; fast for large compressed NPZ files.",
+    )
     return parser.parse_args()
 
 
@@ -93,34 +98,60 @@ def bucket_from_scores(interaction: float, loco: float, scene: float, fine: floa
     return "F_uncertain"
 
 
+def metadata_proxy_scores(priors: dict[str, float]) -> tuple[float, float, float, float, float]:
+    interaction_prior = float(priors["interaction"])
+    loco_prior = float(priors["loco"])
+    scene_prior = float(priors["scene"])
+    fine_prior = float(priors["fine"])
+    ego_motion = max(0.0, min(1.0, 0.55 * interaction_prior + 0.25 * fine_prior + 0.20 * loco_prior))
+    exo_motion = max(0.0, min(1.0, 0.55 * loco_prior + 0.30 * interaction_prior + 0.15 * fine_prior))
+    temporal_diversity = max(0.0, min(1.0, 0.45 * max(interaction_prior, loco_prior) + 0.25 * fine_prior + 0.15))
+    object_motion_proxy = max(0.0, min(1.0, 0.70 * interaction_prior + 0.30 * fine_prior))
+    scene_only = max(0.0, min(1.0, scene_prior))
+    return ego_motion, exo_motion, object_motion_proxy, temporal_diversity, scene_only
+
+
 def main() -> None:
     args = parse_args()
     metadata = load_npz_metadata(args.npz)
     labels = load_labels_by_take(args.labels_jsonl)
     contact_paths = load_contact_paths(args.contact_sheet_manifest)
     grouped = group_indices_by_take(metadata["take_uid"])
-    sampled_indices, sampled_positions_by_take = sampled_index_map(grouped, args.sample_transitions_per_take)
-    with np.load(args.npz, allow_pickle=False) as data:
-        motion = {
-            view_key: per_transition_motion(np.asarray(data[view_key][sampled_indices]))
-            for view_key in args.view_keys
-        }
+    if args.metadata_only:
+        sampled_positions_by_take = {take_uid: [] for take_uid in grouped}
+        motion = {}
+        print(f"Using metadata-only relevance proxy for {len(grouped)} takes", flush=True)
+    else:
+        sampled_indices, sampled_positions_by_take = sampled_index_map(grouped, args.sample_transitions_per_take)
+        print(
+            f"Loading {len(sampled_indices)} sampled transitions from {args.npz}; "
+            "this can be slow for compressed NPZ files.",
+            flush=True,
+        )
+        with np.load(args.npz, allow_pickle=False) as data:
+            motion = {
+                view_key: per_transition_motion(np.asarray(data[view_key][sampled_indices]))
+                for view_key in args.view_keys
+            }
 
     rows = []
     for take_uid, indices in sorted(grouped.items()):
-        sampled = sampled_positions_by_take[take_uid]
         label = labels.get(take_uid, {})
         parent = str(label.get("parent_task_name", ""))
         priors = TASK_PRIORS.get(parent, {"interaction": 0.35, "loco": 0.35, "scene": 0.45, "fine": 0.20})
-        ego_values = motion[args.view_keys[0]][sampled]
-        exo_values = motion[args.view_keys[1]][sampled]
-        ego_motion = normalize_score(float(np.mean(ego_values)), 0.10)
-        exo_motion = normalize_score(float(np.mean(exo_values)), 0.08)
+        if args.metadata_only:
+            ego_motion, exo_motion, object_motion_proxy, temporal_diversity, scene_only = metadata_proxy_scores(priors)
+        else:
+            sampled = sampled_positions_by_take[take_uid]
+            ego_values = motion[args.view_keys[0]][sampled]
+            exo_values = motion[args.view_keys[1]][sampled]
+            ego_motion = normalize_score(float(np.mean(ego_values)), 0.10)
+            exo_motion = normalize_score(float(np.mean(exo_values)), 0.08)
+            object_motion_proxy = ego_motion
+            temporal_diversity = normalize_score(float(np.std(ego_values) + np.std(exo_values)), 0.08)
+            low_motion_scene = 1.0 - max(ego_motion, exo_motion)
+            scene_only = max(0.0, min(1.0, 0.55 * priors["scene"] + 0.45 * low_motion_scene))
         body_motion = exo_motion
-        object_motion_proxy = ego_motion
-        temporal_diversity = normalize_score(float(np.std(ego_values) + np.std(exo_values)), 0.08)
-        low_motion_scene = 1.0 - max(ego_motion, exo_motion)
-        scene_only = max(0.0, min(1.0, 0.55 * priors["scene"] + 0.45 * low_motion_scene))
         interaction_score = max(
             0.0,
             min(
