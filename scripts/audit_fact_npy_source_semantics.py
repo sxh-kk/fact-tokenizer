@@ -52,7 +52,7 @@ def frame_timestamp(sample_id: str, stored_timestamp: float) -> float:
         raise ValueError(f"sample_id has no frozen decimal timestamp: {sample_id!r}") from error
     if abs(parsed - stored_timestamp) > 0.002:
         raise ValueError(f"sample_id/stored timestamp mismatch for {sample_id}")
-    return parsed
+    return stored_timestamp
 
 
 def read_pairs_sequential(
@@ -76,9 +76,9 @@ def read_pairs_sequential(
             # Python's built-in round is bankers rounding and selects frame 10
             # for an exact 10.5 timestamp, while the frozen data selects 11.
             # Float32 timestamps such as 0.350 are stored as 0.349999994;
-            # a one-microframe tolerance preserves the frozen decimal-time
+            # a one-milliframe tolerance preserves the frozen nearest-frame
             # half-up contract instead of incorrectly selecting frame 10.
-            needed[int(np.floor(value * fps + 0.5 + 1e-6))].append(
+            needed[int(np.floor(value * fps + 0.5 + 1e-3))].append(
                 (int(row["source_index"]), endpoint)
             )
     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -217,7 +217,7 @@ def main() -> None:
         "endpoint_semantics": ["t", f"t+{args.transition_seconds:g}s"],
         "resize": args.resize,
         "frame_selection": "floor(timestamp_seconds * 30Hz + 0.5), sequential decode from frame zero",
-        "timestamp_alignment": "decimal timestamp suffix frozen in sample_id (within 2ms of timestamp.npy)",
+        "timestamp_alignment": "timestamp.npy nearest-frame half-up with 1e-3-frame float tolerance; sample_id suffix within 2ms",
         "video_inventory": video_inventory,
         "video_map_jsonl": str(args.video_map_jsonl),
         "video_map_sha256": sha256_file(args.video_map_jsonl),
