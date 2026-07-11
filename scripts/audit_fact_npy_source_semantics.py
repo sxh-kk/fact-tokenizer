@@ -62,7 +62,12 @@ def read_pairs_sequential(
             # Historical materialization used nearest-frame, half-up semantics.
             # Python's built-in round is bankers rounding and selects frame 10
             # for an exact 10.5 timestamp, while the frozen data selects 11.
-            needed[int(np.floor(value * fps + 0.5))].append((int(row["source_index"]), endpoint))
+            # Float32 timestamps such as 0.350 are stored as 0.349999994;
+            # a one-microframe tolerance preserves the frozen decimal-time
+            # half-up contract instead of incorrectly selecting frame 10.
+            needed[int(np.floor(value * fps + 0.5 + 1e-6))].append(
+                (int(row["source_index"]), endpoint)
+            )
     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
     for frame_index in range(max(needed) + 1):
         ok, frame = capture.read()
