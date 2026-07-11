@@ -70,8 +70,10 @@ The frozen numerical configuration is in
   prediction, or pre-filled columns are rejected.
 - `scripts/freeze_fact_npy_source_contract.py` binds RGB color order,
   `t/t+0.5s` endpoint semantics, shapes/dtypes, and all five source NPY hashes.
-  Filtered arrays can inherit the contract only after exact row-by-row parent
-  subset verification.
+  A root contract requires a passed `audit_fact_npy_source_semantics.py`
+  report: every selected gold endpoint is decoded again from its hash-bound
+  raw Ego/Exo video and must match the NPY exactly. Filtered arrays can inherit
+  a parent contract only after exact row-by-row subset verification.
 - `scripts/validate_fact_gold300.py` requires both effect/contact Cohen kappa
   to reach 0.70 on the 60 dual-annotation rows.
 - `scripts/calibrate_fact_weak_semantics.py` is the only way to enable weak

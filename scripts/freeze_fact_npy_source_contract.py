@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import re
 
 import numpy as np
 
@@ -63,34 +62,47 @@ def inspect_source(directory: Path) -> tuple[dict[str, np.ndarray], dict[str, di
     return arrays, files
 
 
-def validate_direct_evidence(code_paths: list[Path], report_path: Path | None) -> dict:
-    if not code_paths:
-        raise ValueError("direct source contract requires --producer-code evidence")
-    code_text = "\n".join(path.read_text(encoding="utf-8") for path in code_paths)
-    if "cv2.COLOR_BGR2RGB" not in code_text:
-        raise ValueError("producer code does not prove BGR→RGB conversion")
-    if "--transition-sec" not in code_text or not re.search(r"default\s*=\s*0\.5", code_text):
-        raise ValueError("producer code does not prove a 0.5-second endpoint default")
+def validate_direct_evidence(
+    code_paths: list[Path],
+    report_path: Path | None,
+    source_dir: Path,
+    files: dict[str, dict],
+) -> tuple[dict, list[str]]:
+    if report_path is None:
+        raise ValueError("direct source contract requires an empirical --producer-report")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get("schema") != "fact-npy-source-semantic-audit-v1" or report.get("passed") is not True:
+        raise ValueError("producer report is not a passed raw-video semantic audit")
+    if Path(report.get("source_dir", "")).resolve() != source_dir.resolve() or report.get("files") != files:
+        raise ValueError("producer report does not bind the current source arrays")
+    if report.get("color_space") != "RGB":
+        raise ValueError("producer report does not declare RGB")
+    if float(report.get("transition_seconds", -1.0)) != 0.5:
+        raise ValueError("producer report does not declare 0.5 seconds")
+    if report.get("endpoint_semantics") != ["t", "t+0.5s"]:
+        raise ValueError("producer report endpoint semantics mismatch")
+    audited_ids = [str(value) for value in report.get("audited_sample_ids", [])]
+    expected_ids_hash = hashlib.sha256("".join(value + "\n" for value in sorted(audited_ids)).encode()).hexdigest()
+    if (
+        not audited_ids
+        or len(audited_ids) != len(set(audited_ids))
+        or report.get("audited_sample_ids_sha256") != expected_ids_hash
+        or int(report.get("audited_samples", -1)) != len(audited_ids)
+        or int(report.get("exact_view_pair_matches", -1)) != 2 * len(audited_ids)
+    ):
+        raise ValueError("producer report has an invalid audited-sample identity contract")
     evidence: dict = {
-        "mode": "direct_rgb_transition_materialization",
+        "mode": "semantic_audit_against_raw_videos",
+        "producer_report": str(report_path),
+        "producer_report_sha256": sha256_file(report_path),
         "producer_code_sha256": {str(path): sha256_file(path) for path in code_paths},
     }
-    if report_path is not None:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        if report.get("color_space") != "RGB":
-            raise ValueError("producer report does not declare RGB")
-        if float(report.get("transition_seconds", -1.0)) != 0.5:
-            raise ValueError("producer report does not declare 0.5 seconds")
-        if report.get("endpoint_semantics") != ["t", "t+0.5s"]:
-            raise ValueError("producer report endpoint semantics mismatch")
-        evidence["producer_report"] = str(report_path)
-        evidence["producer_report_sha256"] = sha256_file(report_path)
-    return evidence
+    return evidence, sorted(audited_ids)
 
 
 def validate_parent_subset(
     arrays: dict[str, np.ndarray], parent_contract_path: Path, row_index_path: Path
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, list[str]]:
     parent_contract = json.loads(parent_contract_path.read_text(encoding="utf-8"))
     if parent_contract.get("schema") != "fact-npy-source-contract-v1":
         raise ValueError("parent source contract schema mismatch")
@@ -119,7 +131,11 @@ def validate_parent_subset(
         "source_row_index": str(row_index_path),
         "source_row_index_sha256": sha256_file(row_index_path),
     }
-    return evidence, parent_contract
+    current_ids = {str(value) for value in arrays["sample_id"]}
+    audited_ids = sorted(current_ids & set(parent_contract.get("audited_sample_ids", [])))
+    if not audited_ids:
+        raise ValueError("parent source contract has no audited IDs in the filtered subset")
+    return evidence, parent_contract, audited_ids
 
 
 def main() -> None:
@@ -130,14 +146,19 @@ def main() -> None:
     if (args.parent_contract is None) != (args.source_row_index is None):
         raise ValueError("--parent-contract and --source-row-index must be supplied together")
     if args.parent_contract is not None:
-        producer_evidence, parent = validate_parent_subset(
+        producer_evidence, parent, audited_sample_ids = validate_parent_subset(
             arrays,
             args.parent_contract,
             args.source_row_index,
         )
         producer_evidence["inherited_producer_evidence"] = parent.get("producer_evidence")
     else:
-        producer_evidence = validate_direct_evidence(args.producer_code, args.producer_report)
+        producer_evidence, audited_sample_ids = validate_direct_evidence(
+            args.producer_code,
+            args.producer_report,
+            args.input_dir,
+            files,
+        )
     contract = {
         "schema": "fact-npy-source-contract-v1",
         "source_dir": str(args.input_dir.resolve()),
@@ -146,6 +167,10 @@ def main() -> None:
         "transition_seconds": 0.5,
         "endpoint_semantics": ["t", "t+0.5s"],
         "files": files,
+        "audited_sample_ids": audited_sample_ids,
+        "audited_sample_ids_sha256": hashlib.sha256(
+            "".join(value + "\n" for value in audited_sample_ids).encode("utf-8")
+        ).hexdigest(),
         "producer_evidence": producer_evidence,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)

@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import csv
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import secrets
 import shutil
+import stat
 import sys
 import uuid
 
@@ -215,7 +217,11 @@ def load_sources(values: list[tuple[str, Path]]) -> tuple[dict[str, tuple[str, i
 
 
 def validate_source_contracts(
-    values: list[tuple[str, Path]], sources: dict[str, dict], *, canonical: bool
+    values: list[tuple[str, Path]],
+    sources: dict[str, dict],
+    required_sample_ids: dict[str, set[str]],
+    *,
+    canonical: bool,
 ) -> dict[str, dict]:
     paths = dict(values)
     if len(paths) != len(values):
@@ -240,6 +246,34 @@ def validate_source_contracts(
             raise ValueError(f"source contract endpoint semantics mismatch for {name}")
         if int(payload.get("rows", -1)) != source["rows"] or payload.get("files") != source["files"]:
             raise ValueError(f"source contract files do not match current NPY content for {name}")
+        audited_ids = [str(value) for value in payload.get("audited_sample_ids", [])]
+        audited_hash = hashlib.sha256(
+            "".join(value + "\n" for value in sorted(audited_ids)).encode("utf-8")
+        ).hexdigest()
+        if (
+            len(audited_ids) != len(set(audited_ids))
+            or payload.get("audited_sample_ids_sha256") != audited_hash
+            or not required_sample_ids.get(name, set()).issubset(set(audited_ids))
+        ):
+            raise ValueError(f"source contract does not audit every selected gold sample for {name}")
+        evidence = payload.get("producer_evidence", {})
+        if canonical and evidence.get("mode") != "semantic_audit_against_raw_videos":
+            raise ValueError(f"canonical source contract lacks raw-video semantic evidence for {name}")
+        if evidence.get("mode") == "semantic_audit_against_raw_videos":
+            report_path = Path(evidence.get("producer_report", ""))
+            if not report_path.is_file() or sha256_file(report_path) != evidence.get("producer_report_sha256"):
+                raise ValueError(f"source semantic report hash mismatch for {name}")
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if (
+                report.get("schema") != "fact-npy-source-semantic-audit-v1"
+                or report.get("passed") is not True
+                or Path(report.get("source_dir", "")).resolve() != source["directory"].resolve()
+                or report.get("files") != source["files"]
+                or sorted(str(value) for value in report.get("audited_sample_ids", [])) != sorted(audited_ids)
+                or report.get("color_space") != "RGB"
+                or float(report.get("transition_seconds", -1.0)) != 0.5
+            ):
+                raise ValueError(f"source semantic report content mismatch for {name}")
         validated[name] = {
             "path": str(path),
             "sha256": sha256_file(path),
@@ -314,7 +348,7 @@ def copy_inputs(
 ) -> dict[str, str]:
     sealed = output / "sealed"
     destination = sealed / "blank_templates"
-    destination.mkdir(parents=True, exist_ok=True)
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     copied: dict[str, str] = {}
     for path in paths:
         if not path.is_file():
@@ -325,7 +359,7 @@ def copy_inputs(
         shutil.copy2(path, target)
         copied[str(target.relative_to(output))] = sha256_file(target)
     provenance = sealed / "provenance"
-    provenance.mkdir(parents=True, exist_ok=True)
+    provenance.mkdir(parents=True, exist_ok=True, mode=0o700)
     for path in [manifest, *([freeze] if freeze else [])]:
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -338,12 +372,14 @@ def copy_inputs(
         target = output / guide.name
         shutil.copy2(guide, target)
         copied[str(target.relative_to(output))] = sha256_file(target)
-    try:
+    if os.name == "posix":
         sealed.chmod(0o700)
         for path in sealed.rglob("*"):
             path.chmod(0o700 if path.is_dir() else 0o600)
-    except OSError:
-        pass
+        for path in [sealed, *sealed.rglob("*")]:
+            expected = 0o700 if path.is_dir() else 0o600
+            if stat.S_IMODE(path.stat().st_mode) != expected:
+                raise PermissionError(f"private review input has unsafe mode: {path}")
     return copied
 
 
@@ -501,14 +537,19 @@ def main() -> None:
     if canonical and args.annotation_guide is None:
         raise ValueError("canonical gold review pack requires --annotation-guide")
     lookup, sources = load_sources(args.source)
-    source_contracts = validate_source_contracts(
-        args.source_contract,
-        sources,
-        canonical=canonical,
-    )
     missing = sorted({str(row["sample_id"]) for row in rows} - set(lookup))
     if missing:
         raise ValueError(f"{len(missing)} gold sample IDs are missing from sources: {missing[:5]}")
+    required_by_source: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        sample_id = str(row["sample_id"])
+        required_by_source[lookup[sample_id][0]].add(sample_id)
+    source_contracts = validate_source_contracts(
+        args.source_contract,
+        sources,
+        required_by_source,
+        canonical=canonical,
+    )
     outputs = {
         "admin": args.admin_output_dir,
         "annotator_a": args.annotator_a_output_dir,
@@ -526,10 +567,33 @@ def main() -> None:
             raise FileExistsError(f"refusing to overwrite existing review artifact: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
     staging = args.admin_output_dir.parent / f".gold-review-work-{uuid.uuid4().hex}"
-    staging.mkdir(parents=False)
+    staging.mkdir(parents=False, mode=0o700)
+    if os.name == "posix" and stat.S_IMODE(staging.stat().st_mode) != 0o700:
+        raise PermissionError("gold review working staging is not private")
     artifact_staging: dict[str, Path] = {}
     published: list[Path] = []
     try:
+        copied = copy_inputs(
+            args.annotation_template,
+            args.annotation_guide,
+            args.gold_manifest,
+            args.gold_freeze,
+            staging,
+        )
+        snapshot_guide = staging / args.annotation_guide.name
+        if freeze is not None and sha256_file(snapshot_guide) != freeze["annotation_guide"]["sha256"]:
+            raise ValueError("private guide snapshot differs from the gold freeze")
+        expected_templates = {
+            record["path"]: record["template_sha256"]
+            for split, record in (freeze or {}).get("annotation_templates", {}).items()
+            if split in included_splits
+        }
+        snapshot_templates = {
+            path.name: sha256_file(path)
+            for path in (staging / "sealed" / "blank_templates").glob("*.csv")
+        }
+        if freeze is not None and snapshot_templates != expected_templates:
+            raise ValueError("private template snapshots differ from the gold freeze")
         selected_digest = hashlib.sha256()
         nonce = secrets.token_bytes(32)
         image_inventory: list[dict] = []
@@ -634,13 +698,6 @@ def main() -> None:
                 writer = csv.DictWriter(handle, fieldnames=task_fields)
                 writer.writeheader()
                 writer.writerows(selected_tasks)
-        copied = copy_inputs(
-            args.annotation_template,
-            args.annotation_guide,
-            args.gold_manifest,
-            args.gold_freeze,
-            staging,
-        )
         binding = {
             "gold_manifest_sha256": sha256_file(args.gold_manifest),
             "selected_ego_exo_content_sha256": selected_digest.hexdigest(),
@@ -705,7 +762,7 @@ def main() -> None:
                 task_source=task_paths["annotator_a"],
                 image_source_root=staging,
                 inventory=inventories["annotator_a"],
-                guide=args.annotation_guide,
+                guide=snapshot_guide,
                 binding=binding,
             ),
             "annotator_b": build_delivery_artifact(
@@ -714,13 +771,15 @@ def main() -> None:
                 task_source=task_paths["annotator_b_dual_only"],
                 image_source_root=staging,
                 inventory=inventories["annotator_b"],
-                guide=args.annotation_guide,
+                guide=snapshot_guide,
                 binding=binding,
             ),
         }
         report["delivery_manifests"] = delivery_reports
         admin_staging = artifact_staging["admin"]
-        admin_staging.mkdir(parents=False)
+        admin_staging.mkdir(parents=False, mode=0o700)
+        if os.name == "posix" and stat.S_IMODE(admin_staging.stat().st_mode) != 0o700:
+            raise PermissionError("admin review staging is not private")
         shutil.copytree(staging / "sealed", admin_staging / "sealed")
         shutil.copy2(staging / args.annotation_guide.name, admin_staging / args.annotation_guide.name)
         report_path = admin_staging / "review_pack_admin.json"
@@ -733,6 +792,8 @@ def main() -> None:
         for name in ("annotator_a", "annotator_b", "admin"):
             artifact_staging[name].replace(outputs[name])
             published.append(outputs[name])
+        if os.name == "posix" and stat.S_IMODE(outputs["admin"].stat().st_mode) != 0o700:
+            raise PermissionError("published admin artifact is not private")
         shutil.rmtree(staging)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

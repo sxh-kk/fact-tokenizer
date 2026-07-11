@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 import csv
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -196,9 +197,27 @@ def test_freeze_npy_source_contract_binds_rgb_transition_and_arrays(tmp_path: Pa
     np.save(source / "sample_id.npy", np.asarray(["a", "b"]))
     np.save(source / "take_uid.npy", np.asarray(["ta", "tb"]))
     np.save(source / "timestamp.npy", np.asarray([1.0, 2.0], dtype=np.float32))
-    producer = tmp_path / "producer.py"
-    producer.write_text(
-        "# cv2.COLOR_BGR2RGB\n# parser.add_argument('--transition-sec', default=0.5)\n",
+    _, sources = load_sources([("source", source)])
+    audited_ids = ["a", "b"]
+    report = tmp_path / "semantic_audit.json"
+    report.write_text(
+        json.dumps(
+            {
+                "schema": "fact-npy-source-semantic-audit-v1",
+                "passed": True,
+                "source_dir": str(source.resolve()),
+                "files": sources["source"]["files"],
+                "color_space": "RGB",
+                "transition_seconds": 0.5,
+                "endpoint_semantics": ["t", "t+0.5s"],
+                "audited_sample_ids": audited_ids,
+                "audited_sample_ids_sha256": hashlib.sha256(
+                    "".join(value + "\n" for value in audited_ids).encode()
+                ).hexdigest(),
+                "audited_samples": 2,
+                "exact_view_pair_matches": 4,
+            }
+        ),
         encoding="utf-8",
     )
     contract = tmp_path / "contract.json"
@@ -210,16 +229,20 @@ def test_freeze_npy_source_contract_binds_rgb_transition_and_arrays(tmp_path: Pa
             str(source),
             "--output-json",
             str(contract),
-            "--producer-code",
-            str(producer),
+            "--producer-report",
+            str(report),
         ],
         cwd=root,
         check=True,
         capture_output=True,
         text=True,
     )
-    _, sources = load_sources([("source", source)])
-    validated = validate_source_contracts([("source", contract)], sources, canonical=True)
+    validated = validate_source_contracts(
+        [("source", contract)],
+        sources,
+        {"source": set(audited_ids)},
+        canonical=True,
+    )
     assert validated["source"]["sha256"]
     payload = json.loads(contract.read_text(encoding="utf-8"))
     assert payload["color_space"] == "RGB"
