@@ -44,23 +44,38 @@ def as_text(value: object) -> str:
     return str(value)
 
 
-def read_frame_pair_by_index(
-    capture: cv2.VideoCapture, timestamp: float, transition_seconds: float, resize: int
-) -> np.ndarray | None:
+def read_pairs_sequential(
+    capture: cv2.VideoCapture, requests: list[dict], transition_seconds: float, resize: int
+) -> dict[int, np.ndarray]:
     fps = float(capture.get(cv2.CAP_PROP_FPS))
     if not np.isfinite(fps) or abs(fps - 30.0) > 1e-3:
         raise ValueError(f"semantic audit requires a 30Hz aligned video, got {fps}")
-    frames = []
-    for value in (timestamp, timestamp + transition_seconds):
-        frame_index = int(round(value * fps))
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    needed: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    results: dict[int, list[np.ndarray | None]] = {
+        int(row["source_index"]): [None, None] for row in requests
+    }
+    for row in requests:
+        for endpoint, value in enumerate(
+            (float(row["timestamp"]), float(row["timestamp"]) + transition_seconds)
+        ):
+            needed[int(round(value * fps))].append((int(row["source_index"]), endpoint))
+    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for frame_index in range(max(needed) + 1):
         ok, frame = capture.read()
         if not ok or frame is None:
-            return None
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (resize, resize), interpolation=cv2.INTER_AREA)
-        frames.append(frame)
-    return np.stack(frames, axis=0)
+            raise RuntimeError(f"raw video ended before required frame {frame_index}")
+        if frame_index not in needed:
+            continue
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.resize(rgb, (resize, resize), interpolation=cv2.INTER_AREA)
+        for source_index, endpoint in needed[frame_index]:
+            results[source_index][endpoint] = rgb.copy()
+    if any(frame is None for pair in results.values() for frame in pair):
+        raise RuntimeError("sequential raw decoder did not materialize every requested endpoint")
+    return {
+        source_index: np.stack([pair[0], pair[1]], axis=0)
+        for source_index, pair in results.items()
+    }
 
 
 def main() -> None:
@@ -120,16 +135,13 @@ def main() -> None:
         if not all(capture.isOpened() for capture in captures.values()):
             raise RuntimeError(f"cannot open raw videos for {take_uid}")
         try:
+            decoded_by_view = {
+                view: read_pairs_sequential(capture, by_take[take_uid], 0.5, args.resize)
+                for view, capture in captures.items()
+            }
             for row in sorted(by_take[take_uid], key=lambda value: value["timestamp"]):
-                for view, capture in captures.items():
-                    decoded = read_frame_pair_by_index(
-                        capture,
-                        float(row["timestamp"]),
-                        0.5,
-                        args.resize,
-                    )
-                    if decoded is None:
-                        raise RuntimeError(f"raw decode failed for {row['sample_id']} {view}")
+                for view in captures:
+                    decoded = decoded_by_view[view][row["source_index"]]
                     stored = np.asarray(arrays[view][row["source_index"]])
                     if np.array_equal(decoded, stored):
                         exact_matches += 1
@@ -170,7 +182,7 @@ def main() -> None:
         "transition_seconds": 0.5,
         "endpoint_semantics": ["t", "t+0.5s"],
         "resize": args.resize,
-        "frame_selection": "round(timestamp_seconds * 30Hz), exact CAP_PROP_POS_FRAMES seek",
+        "frame_selection": "round(timestamp_seconds * 30Hz), sequential decode from frame zero",
         "video_inventory": video_inventory,
         "video_map_jsonl": str(args.video_map_jsonl),
         "video_map_sha256": sha256_file(args.video_map_jsonl),
