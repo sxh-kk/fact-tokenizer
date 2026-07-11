@@ -1,5 +1,8 @@
 # FACT Tokenizer MVP
 
+The isolated continuous FACT v7 effect pipeline is documented in
+[`docs/fact_effect_v7_implementation.md`](docs/fact_effect_v7_implementation.md).
+
 [中文版](README.zh-CN.md)
 
 First-stage FACT tokenizer prototype for learning ego-accessible shared action tokens from paired ego/exo video transitions.

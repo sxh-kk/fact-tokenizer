@@ -90,6 +90,7 @@ def test_extract_features_and_annotation_export(tmp_path: Path) -> None:
         annotation_rows = list(csv.DictReader(handle))
     assert len(annotation_rows) == 2
     assert "usable_for" in annotation_rows[0]
+    assert {"scene_only_risk", "ego_exo_sync_quality"}.issubset(annotation_rows[0])
 
     full_annotation = tmp_path / "annotation_full.csv"
     run_tool(
@@ -118,6 +119,8 @@ def test_validate_annotations_rejects_bad_values_and_accepts_valid_rows(tmp_path
         "exo_body_visibility",
         "object_interaction",
         "phase_diversity",
+        "scene_only_risk",
+        "ego_exo_sync_quality",
         "usable_for",
         "notes",
     ]
@@ -132,6 +135,8 @@ def test_validate_annotations_rejects_bad_values_and_accepts_valid_rows(tmp_path
                 "exo_body_visibility": "2",
                 "object_interaction": "2",
                 "phase_diversity": "2",
+                "scene_only_risk": "0",
+                "ego_exo_sync_quality": "ok",
                 "usable_for": "tokenizer_main",
                 "notes": "",
             }
@@ -150,6 +155,8 @@ def test_validate_annotations_rejects_bad_values_and_accepts_valid_rows(tmp_path
                 "exo_body_visibility": "0",
                 "object_interaction": "0",
                 "phase_diversity": "0",
+                "scene_only_risk": "2",
+                "ego_exo_sync_quality": "ok",
                 "usable_for": "tokenizer_main",
                 "notes": "",
             }

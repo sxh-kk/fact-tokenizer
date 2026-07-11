@@ -1,0 +1,73 @@
+schema: fact-effect-v7-config-v1
+representation_name: pose-conditioned-camera-compensated-2d-observed-interaction-transition
+claims:
+  dense_3d_flow: false
+  physical_causal_effect: false
+  cross_embodiment: false
+quantization: "off"
+transition_seconds: 0.5
+image_size: 224
+camera_pose:
+  fps: 30
+  max_skew_frames: 1
+  extrinsic_convention: world_to_camera
+targets:
+  full_dino_delta:
+    weight: 1.0
+    scope: all_rgb
+  object_roi_dino_delta:
+    weight: 0.5
+    scope: valid_relations_masks_only
+    target_only: true
+  rotation_compensated_flow_2d:
+    weight: 0.25
+    estimator: torchvision_raft_large
+    translation_fully_removed: false
+  cross_view_semantic_consistency:
+    weight: 0.1
+  pose_camera_nuisance_consistency:
+    weight: 0.1
+  weak_semantics:
+    weight: 0.1
+    enabled: false
+    minimum_dev_precision: 0.80
+    calibration_samples: 60
+    free_numeric_override_allowed: false
+unsupported_targets:
+  depth: fail_fast
+  flow_3d: fail_fast
+data_guards:
+  diagnostic_codelabel_training_valid: false
+  assembly101_training_valid: false
+  gold_encoder_backprop: false
+  locked_test_model_selection: false
+  gold_probe_train_takes_excluded: 47
+  full_target_cache_requires_visual_gate: true
+  paired_controls_share_eligibility: true
+  target_cache_binds_weight_and_sidecar_hashes: true
+experiments:
+  bridge: [C0, C1, C2, T1, T2]
+  paired_controls: [P0, P1, P2, P3, P4]
+runs:
+  smoke:
+    steps: 100
+  screen:
+    steps: 5000
+    seeds: [42, 43]
+  final:
+    experiments: [P0, P2, P3, P4]
+    steps: 20000
+    seeds: [42, 43, 44]
+  global_batch: 32
+  gpus_per_run: 2
+  step_unit: optimizer_update
+  p4_compute_contract: one_primary_plus_one_extra_ego_forward_per_micro_batch
+go_gate:
+  p2_vs_p0_macro_f1_delta: 0.05
+  p2_vs_p3_macro_f1_delta: 0.03
+  p2_vs_p4_macro_f1_delta: 0.03
+  bootstrap_unit: take
+  ci95_lower_bound_strictly_positive: true
+  all_three_seeds_same_direction: true
+  maximum_take_view_nmi_worsening: 0.02
+report_separately: [filtered, unfiltered, fresh_short73]
