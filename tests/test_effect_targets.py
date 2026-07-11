@@ -31,6 +31,7 @@ from fact_tokenizer.effect_targets import (
 )
 from fact_tokenizer.effect_manifest import EffectCapability, EffectSampleRecord, write_manifest_jsonl
 from scripts.audit_fact_effect_targets import validate as validate_visual_audit
+from scripts.build_fact_effect_targets import npy_identity, validate_formal_input_contract
 
 
 def test_scale_intrinsics_uses_independent_xy_scales() -> None:
@@ -40,6 +41,55 @@ def test_scale_intrinsics_uses_independent_xy_scales() -> None:
         scaled,
         [[250.0, 0.0, 125.0], [0.0, 320.0, 100.0], [0.0, 0.0, 1.0]],
     )
+
+
+def test_formal_target_input_binds_exact_frame_sidecar_and_manifest(tmp_path: Path) -> None:
+    sample_ids = np.asarray(["take_a:1.000", "take_b:2.000"])
+    take_uids = np.asarray(["take_a", "take_b"])
+    timestamps = np.asarray([1.0, 2.0], dtype=np.float32)
+    frames = np.zeros((2, 2, 4, 4, 3), dtype=np.uint8)
+    for name, value in {
+        "ego": frames,
+        "exo": frames,
+        "sample_id": sample_ids,
+        "take_uid": take_uids,
+        "timestamp": timestamps,
+        "frame_index": np.asarray([30, 60], dtype=np.int64),
+    }.items():
+        np.save(tmp_path / f"{name}.npy", value)
+    files = {
+        name: npy_identity(tmp_path / f"{name}.npy")
+        for name in ("ego", "exo", "sample_id", "take_uid", "timestamp")
+    }
+    report = {
+        "schema": "fact-npy-transition-subset-v1",
+        "color_space": "RGB",
+        "transition_seconds": 0.5,
+        "endpoint_semantics": ["t", "t+0.5s"],
+        "frame_rate_hz": 30.0,
+        "endpoint_offset_frames": 15,
+        "files": files,
+        "frame_index": npy_identity(tmp_path / "frame_index.npy"),
+    }
+    (tmp_path / "materialization_report.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+    records = [
+        EffectSampleRecord(
+            sample_id=str(sample_ids[index]),
+            take_uid=str(take_uids[index]),
+            split="train",
+            row_index=index,
+            source_dataset="test",
+            timestamp=float(timestamps[index]),
+        )
+        for index in range(2)
+    ]
+    identity = validate_formal_input_contract(tmp_path, records, 0.5)
+    assert identity["frame_index"]["sha256"] == report["frame_index"]["sha256"]
+    np.save(tmp_path / "frame_index.npy", np.asarray([31, 60], dtype=np.int64))
+    with pytest.raises(ValueError, match="frame index"):
+        validate_formal_input_contract(tmp_path, records, 0.5)
 
 
 def test_pose_alignment_accepts_one_frame_and_rejects_more() -> None:

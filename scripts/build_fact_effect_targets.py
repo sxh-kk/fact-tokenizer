@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional frozen manifest-row index vector for a stratified audit cache shard.",
     )
     parser.add_argument(
+        "--sample-index-contract",
+        type=Path,
+        help="Hash-bound selection JSON; required with --sample-index-npy for formal targets.",
+    )
+    parser.add_argument(
         "--visual-audit-gate",
         type=Path,
         help="Required for a full formal cache; must be the passed 50-sample gate JSON.",
@@ -126,6 +131,83 @@ def load_mmap(path: Path, expected: int | None = None) -> np.ndarray:
     if expected is not None and len(array) != expected:
         raise ValueError(f"{path} has {len(array)} rows, expected {expected}")
     return array
+
+
+def as_text(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def npy_identity(path: Path) -> dict:
+    array = np.load(path, mmap_mode="r", allow_pickle=False)
+    return {
+        "sha256": sha256_file(path),
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+    }
+
+
+def validate_formal_input_contract(
+    input_dir: Path,
+    records: Sequence,
+    transition_seconds: float,
+) -> dict:
+    if transition_seconds != 0.5:
+        raise ValueError("formal v7 targets require exactly 0.5-second transitions")
+    report_path = input_dir / "materialization_report.json"
+    frame_index_path = input_dir / "frame_index.npy"
+    if not report_path.is_file() or not frame_index_path.is_file():
+        raise ValueError("formal target input requires materialization_report.json and frame_index.npy")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if (
+        report.get("schema")
+        not in {
+            "fact-npy-transition-rebuild-v1",
+            "fact-npy-transition-subset-v1",
+            "fact-short73-materialization-v3",
+        }
+        or report.get("color_space") != "RGB"
+        or float(report.get("transition_seconds", -1.0)) != 0.5
+        or report.get("endpoint_semantics") != ["t", "t+0.5s"]
+        or float(report.get("frame_rate_hz", -1.0)) != 30.0
+        or int(report.get("endpoint_offset_frames", -1)) != 15
+    ):
+        raise ValueError("formal target input has an invalid transition materialization report")
+    names = ("ego", "exo", "sample_id", "take_uid", "timestamp")
+    files = {name: npy_identity(input_dir / f"{name}.npy") for name in names}
+    if report.get("files") != files:
+        raise ValueError("formal target input arrays no longer match the materialization report")
+    frame_identity = npy_identity(frame_index_path)
+    reported_frame = report.get("frame_index", {})
+    if any(reported_frame.get(key) != value for key, value in frame_identity.items()):
+        raise ValueError("formal target frame index no longer matches the materialization report")
+    frame_indices = np.load(frame_index_path, mmap_mode="r", allow_pickle=False)
+    if (
+        frame_indices.ndim != 1
+        or len(frame_indices) != len(records)
+        or not np.issubdtype(frame_indices.dtype, np.integer)
+        or (frame_indices < 0).any()
+    ):
+        raise ValueError("formal target frame_index.npy is invalid")
+    sample_ids = np.load(input_dir / "sample_id.npy", mmap_mode="r", allow_pickle=False)
+    take_uids = np.load(input_dir / "take_uid.npy", mmap_mode="r", allow_pickle=False)
+    timestamps = np.load(input_dir / "timestamp.npy", mmap_mode="r", allow_pickle=False)
+    for index, record in enumerate(records):
+        if (
+            record.row_index != index
+            or record.sample_id != as_text(sample_ids[index])
+            or record.take_uid != as_text(take_uids[index])
+            or abs(float(record.timestamp or 0.0) - float(timestamps[index])) > 1e-3
+        ):
+            raise ValueError(f"manifest/source row contract differs at index {index}")
+    return {
+        "materialization_report": str(report_path.resolve()),
+        "materialization_report_sha256": sha256_file(report_path),
+        "schema": report["schema"],
+        "files": files,
+        "frame_index": frame_identity,
+    }
 
 
 def video_tensor(sample: np.ndarray, size: int, device: torch.device) -> torch.Tensor:
@@ -278,6 +360,53 @@ def main() -> None:
     device = torch.device(args.device)
     records = read_manifest_jsonl(args.manifest)
     count = len(records)
+    if args.sample_index_contract is not None and args.sample_index_npy is None:
+        raise ValueError("--sample-index-contract requires --sample-index-npy")
+    manifest_indices: np.ndarray | range
+    selection_provenance = None
+    if args.sample_index_npy is not None:
+        if args.start != 0 or args.limit is not None:
+            raise ValueError("sample-index selection cannot be combined with --start/--limit")
+        if not args.allow_smoke_targets and args.sample_index_contract is None:
+            raise ValueError("formal sample-index targets require --sample-index-contract")
+        loaded_indices = np.load(args.sample_index_npy, mmap_mode="r", allow_pickle=False)
+        if loaded_indices.ndim != 1:
+            raise ValueError("sample-index NPY must be a one-dimensional manifest-row vector")
+        manifest_indices = np.asarray(loaded_indices, dtype=np.int64)
+        if len(set(manifest_indices.tolist())) != len(manifest_indices):
+            raise ValueError("sample-index NPY contains duplicates")
+        if (manifest_indices < 0).any() or (manifest_indices >= count).any():
+            raise ValueError("sample-index NPY contains an out-of-range manifest row")
+        selection_provenance = {
+            "sample_index_npy": str(args.sample_index_npy.resolve()),
+            "sample_index_sha256": sha256_file(args.sample_index_npy),
+            "rows": len(manifest_indices),
+        }
+        if args.sample_index_contract is not None:
+            selection = json.loads(args.sample_index_contract.read_text(encoding="utf-8"))
+            selected_ids = [records[int(index)].sample_id for index in manifest_indices]
+            if (
+                selection.get("schema") != "fact-target-audit-selection-v1"
+                or selection.get("index_sha256") != selection_provenance["sample_index_sha256"]
+                or selection.get("manifest_sha256") != sha256_file(args.manifest)
+                or int(selection.get("sample_count", -1)) != len(manifest_indices)
+                or [str(value) for value in selection.get("sample_ids", [])] != selected_ids
+            ):
+                raise ValueError("sample-index contract does not bind this manifest selection")
+            selection_provenance.update(
+                {
+                    "selection_contract": str(args.sample_index_contract.resolve()),
+                    "selection_contract_sha256": sha256_file(args.sample_index_contract),
+                }
+            )
+    else:
+        stop = count if args.limit is None else min(count, args.start + args.limit)
+        manifest_indices = range(args.start, stop)
+    input_contract = (
+        None
+        if args.allow_smoke_targets
+        else validate_formal_input_contract(args.input_dir, records, args.transition_seconds)
+    )
     arrays = {view: load_mmap(args.input_dir / f"{view}.npy", count) for view in args.views}
     cameras = {view: CameraSidecar(path, count) for view, path in args.camera_sidecar}
     masks = {view: load_mmap(path, count) for view, path in args.object_mask_npy}
@@ -351,12 +480,19 @@ def main() -> None:
         "claim": "pose-conditioned camera-compensated 2D observed interaction transition representation",
         "depth_available": False,
         "flow_3d_available": False,
+        "input_transition_contract": input_contract,
+        "selection_contract": selection_provenance,
         "source_hashes": {
             "builder_code": sha256_file(Path(__file__)),
             "effect_targets_code": sha256_file(ROOT / "fact_tokenizer" / "effect_targets.py"),
             "manifest": sha256_file(args.manifest),
             "views": {
-                view: sha256_file(args.input_dir / f"{view}.npy") for view in args.views
+                view: (
+                    input_contract["files"][view]["sha256"]
+                    if input_contract is not None
+                    else sha256_file(args.input_dir / f"{view}.npy")
+                )
+                for view in args.views
             },
             "camera_sidecars": {
                 view: {
@@ -429,18 +565,6 @@ def main() -> None:
         json.dumps(build_provenance, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    if args.sample_index_npy is not None:
-        manifest_indices = np.load(args.sample_index_npy, mmap_mode="r", allow_pickle=False)
-        if manifest_indices.ndim != 1:
-            raise ValueError("sample-index NPY must be a one-dimensional manifest-row vector")
-        manifest_indices = np.asarray(manifest_indices, dtype=np.int64)
-        if len(set(manifest_indices.tolist())) != len(manifest_indices):
-            raise ValueError("sample-index NPY contains duplicates")
-        if (manifest_indices < 0).any() or (manifest_indices >= count).any():
-            raise ValueError("sample-index NPY contains an out-of-range manifest row")
-    else:
-        stop = count if args.limit is None else min(count, args.start + args.limit)
-        manifest_indices = range(args.start, stop)
     for manifest_index in manifest_indices:
         manifest_index = int(manifest_index)
         record = records[manifest_index]
