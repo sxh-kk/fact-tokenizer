@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from audit_fact_npy_source_semantics import read_pairs_sequential  # noqa: E402
+from audit_fact_npy_source_semantics import frame_timestamp, read_pairs_sequential  # noqa: E402
 from prepare_fact_egoexo_npz import resolve_video  # noqa: E402
 
 
@@ -89,7 +89,12 @@ def main() -> None:
     ):
         take_uid = as_text(raw_take)
         by_take[take_uid].append(
-            {"sample_id": sample_id, "source_index": index, "timestamp": float(raw_timestamp)}
+            {
+                "sample_id": sample_id,
+                "source_index": index,
+                "timestamp": float(raw_timestamp),
+                "frame_timestamp": frame_timestamp(sample_id, float(raw_timestamp)),
+            }
         )
     missing = sorted(set(by_take) - set(video_rows))
     if missing:

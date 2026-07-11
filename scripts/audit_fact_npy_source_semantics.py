@@ -45,6 +45,16 @@ def as_text(value: object) -> str:
     return str(value)
 
 
+def frame_timestamp(sample_id: str, stored_timestamp: float) -> float:
+    try:
+        parsed = float(sample_id.rsplit(":", 1)[1])
+    except (IndexError, ValueError) as error:
+        raise ValueError(f"sample_id has no frozen decimal timestamp: {sample_id!r}") from error
+    if abs(parsed - stored_timestamp) > 0.002:
+        raise ValueError(f"sample_id/stored timestamp mismatch for {sample_id}")
+    return parsed
+
+
 def read_pairs_sequential(
     capture: cv2.VideoCapture, requests: list[dict], transition_seconds: float, resize: int
 ) -> dict[int, np.ndarray]:
@@ -57,7 +67,10 @@ def read_pairs_sequential(
     }
     for row in requests:
         for endpoint, value in enumerate(
-            (float(row["timestamp"]), float(row["timestamp"]) + transition_seconds)
+            (
+                float(row.get("frame_timestamp", row["timestamp"])),
+                float(row.get("frame_timestamp", row["timestamp"])) + transition_seconds,
+            )
         ):
             # Historical materialization used nearest-frame, half-up semantics.
             # Python's built-in round is bankers rounding and selects frame 10
@@ -115,7 +128,14 @@ def main() -> None:
         timestamp = float(arrays["timestamp"][index])
         if take_uid != str(row["take_uid"]) or abs(timestamp - float(row["timestamp"])) > 1e-3:
             raise ValueError(f"gold/source metadata mismatch for {sample_id}")
-        by_take[take_uid].append({**row, "source_index": index, "timestamp": timestamp})
+        by_take[take_uid].append(
+            {
+                **row,
+                "source_index": index,
+                "timestamp": timestamp,
+                "frame_timestamp": frame_timestamp(sample_id, timestamp),
+            }
+        )
     missing_maps = sorted(set(by_take) - set(video_rows))
     if missing_maps:
         raise ValueError(f"video map is missing {len(missing_maps)} takes: {missing_maps[:5]}")
@@ -197,6 +217,7 @@ def main() -> None:
         "endpoint_semantics": ["t", f"t+{args.transition_seconds:g}s"],
         "resize": args.resize,
         "frame_selection": "floor(timestamp_seconds * 30Hz + 0.5), sequential decode from frame zero",
+        "timestamp_alignment": "decimal timestamp suffix frozen in sample_id (within 2ms of timestamp.npy)",
         "video_inventory": video_inventory,
         "video_map_jsonl": str(args.video_map_jsonl),
         "video_map_sha256": sha256_file(args.video_map_jsonl),
