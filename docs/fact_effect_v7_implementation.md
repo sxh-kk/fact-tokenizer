@@ -18,14 +18,17 @@ cross-embodiment validity.
 
 ## Migrated NPY transition correction
 
-The filtering-v2 snapshot must not be used directly as a v7 video source:
-raw-video reconstruction showed its second endpoint is `t+1.0s` despite the
-historical directory name containing `t0p5`. Use
-`rebuild_fact_npy_transition.py` to decode the complete no-filter source at an
-explicit 0.5 seconds, then `materialize_fact_npy_subset.py` to derive filtered
-rows by the frozen source-row index. Both publish atomically with content and
-raw-video provenance hashes. Any target cache built from the legacy arrays is
-diagnostic-only and must be rebuilt.
+The filtering-v2 snapshot must not be used directly as a v7 video source.
+Raw-video reconstruction showed that the complete no-filter arrays are already
+`t+0.5s`, while the independently materialized filtering-v2 arrays use
+`t+1.0s` despite the historical directory name containing `t0p5`. Use
+`rebuild_fact_npy_transition.py --source-transition-seconds 0.5` to anchor and
+hash-bind every no-filter endpoint to exact raw-video frame indices, then use
+`materialize_fact_npy_subset.py` to derive filtered rows by the frozen source
+row index. The rebuild CLI requires the empirically verified source spacing so
+the two legacy families cannot be confused. Both tools publish atomically with
+content and raw-video provenance hashes. Any target cache built from the
+legacy filtered arrays is diagnostic-only and must be rebuilt.
 
 ## Build order
 

@@ -37,8 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-transition-seconds",
         type=float,
-        default=1.0,
-        help="Observed endpoint spacing in the frozen input arrays (1.0 for legacy dense NPY).",
+        required=True,
+        help="Empirically verified endpoint spacing in the frozen input arrays.",
     )
     parser.add_argument("--resize", type=int, default=224)
     return parser.parse_args()
