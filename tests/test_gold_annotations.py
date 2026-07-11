@@ -16,9 +16,25 @@ from fact_tokenizer.gold_annotations import (
     validate_gold_rows,
     write_gold_pack,
 )
+from scripts.materialize_fact_gold300_review import (
+    aligned_endpoints,
+    load_sources,
+    validate_freeze,
+    validate_gold,
+    validate_source_contracts,
+    validate_templates,
+)
 
 
-@pytest.mark.parametrize("script", ["prepare_fact_gold300.py", "validate_fact_gold300.py"])
+@pytest.mark.parametrize(
+    "script",
+    [
+        "prepare_fact_gold300.py",
+        "validate_fact_gold300.py",
+        "materialize_fact_gold300_review.py",
+        "freeze_fact_npy_source_contract.py",
+    ],
+)
 def test_gold_cli_bootstraps_repo_imports(script: str) -> None:
     completed = subprocess.run(
         [sys.executable, f"scripts/{script}", "--help"],
@@ -28,6 +44,186 @@ def test_gold_cli_bootstraps_repo_imports(script: str) -> None:
         text=True,
     )
     assert "usage:" in completed.stdout
+
+
+def test_materialize_gold_review_pack_joins_sources_and_renders_blind_images(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    gold_rows = []
+    source_arguments = []
+    for source_index, split in enumerate(("probe_train", "calibration_dev", "probe_train")):
+        source = tmp_path / f"source_{source_index}"
+        source.mkdir()
+        sample_id = f"sample_{source_index}"
+        frames = np.zeros((1, 2, 20, 24, 3), dtype=np.uint8)
+        frames[:, 1] = 40 + source_index
+        np.save(source / "ego.npy", frames)
+        np.save(source / "exo.npy", frames[:, :, :, ::-1])
+        np.save(source / "sample_id.npy", np.asarray([sample_id]))
+        np.save(source / "take_uid.npy", np.asarray([f"take_{source_index}"]))
+        np.save(source / "timestamp.npy", np.asarray([float(source_index)], dtype=np.float32))
+        gold_rows.append(
+            {
+                "sample_id": sample_id,
+                "take_uid": f"take_{source_index}",
+                "gold_split": split,
+                "timestamp": float(source_index),
+                "source_dataset": "test",
+                "dual_annotation": source_index == 1,
+                "representation_training_valid": False,
+            }
+        )
+        source_arguments.extend(["--source", f"source_{source_index}={source}"])
+    gold_path = tmp_path / "gold.jsonl"
+    gold_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in gold_rows),
+        encoding="utf-8",
+    )
+    template_path = tmp_path / "blank_annotations.csv"
+    template_fields = [*gold_rows[0], "effect_label", "contact_label", "annotator_id"]
+    with template_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=template_fields)
+        writer.writeheader()
+        writer.writerows(gold_rows)
+    guide_path = tmp_path / "guide.md"
+    guide_path.write_text("blind guide\n", encoding="utf-8")
+    admin_output = tmp_path / "review_admin"
+    annotator_a_output = tmp_path / "review_annotator_a"
+    annotator_b_output = tmp_path / "review_annotator_b"
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/materialize_fact_gold300_review.py",
+            "--gold-manifest",
+            str(gold_path),
+            *source_arguments,
+            "--annotation-template",
+            str(template_path),
+            "--annotation-guide",
+            str(guide_path),
+            "--admin-output-dir",
+            str(admin_output),
+            "--annotator-a-output-dir",
+            str(annotator_a_output),
+            "--annotator-b-output-dir",
+            str(annotator_b_output),
+            "--allow-noncanonical-count",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads((admin_output / "review_pack_admin.json").read_text(encoding="utf-8"))
+    assert report["samples"] == 3
+    assert report["labels_in_review_images"] is False
+    assert report["sample_identity_in_review_images"] is False
+    assert (admin_output / "sealed" / "image_inventory.jsonl").is_file()
+    assert (admin_output / "sealed" / "blank_templates" / template_path.name).is_file()
+    assert not (annotator_a_output / "sealed").exists()
+    assert not (annotator_b_output / "sealed").exists()
+    assert len(list((annotator_a_output / "images").rglob("*.png"))) == 3
+    assert len(list((annotator_b_output / "images").rglob("*.png"))) == 1
+    with (annotator_a_output / "task.csv").open(newline="", encoding="utf-8") as handle:
+        assert len(list(csv.DictReader(handle))) == 3
+    with (annotator_b_output / "task.csv").open(newline="", encoding="utf-8") as handle:
+        assert len(list(csv.DictReader(handle))) == 1
+
+
+def test_gold_review_pack_rejects_unfrozen_nonblind_and_misaligned_inputs(tmp_path: Path) -> None:
+    row = {
+        "sample_id": "sample",
+        "take_uid": "take",
+        "gold_split": "probe_train",
+        "timestamp": 1.0,
+        "source_dataset": "test",
+        "dual_annotation": False,
+        "representation_training_valid": False,
+    }
+    malicious = {**row, "gold_split": "../../outside"}
+    with pytest.raises(ValueError, match="invalid gold_split"):
+        validate_gold([malicious], canonical=False)
+
+    manifest = tmp_path / "gold.jsonl"
+    manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    freeze = tmp_path / "freeze.json"
+    freeze.write_text(
+        json.dumps(
+            {
+                "schema": "fact-effect-gold-v1",
+                "manifest_sha256": "0" * 64,
+                "sample_counts": {"probe_train": 1},
+                "representation_training_valid": False,
+                "seed": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not bind"):
+        validate_freeze(freeze, manifest, [row], None, canonical=False)
+
+    template = tmp_path / "nonblind.csv"
+    fields = [*row, "effect_label", "contact_label", "annotator_id"]
+    with template.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow({**row, "effect_label": "no_effect", "contact_label": "none"})
+    with pytest.raises(ValueError, match="not blind"):
+        validate_templates(
+            [template],
+            [row],
+            canonical=False,
+            expected_splits={"probe_train"},
+        )
+
+    source = tmp_path / "source"
+    source.mkdir()
+    np.save(source / "ego.npy", np.zeros((1, 2, 8, 8, 3), dtype=np.uint8))
+    np.save(source / "exo.npy", np.zeros((1, 2, 8, 8, 3), dtype=np.uint8))
+    np.save(source / "sample_id.npy", np.asarray(["sample"]))
+    np.save(source / "take_uid.npy", np.asarray(["wrong_take"]))
+    np.save(source / "timestamp.npy", np.asarray([1.0], dtype=np.float32))
+    _, sources = load_sources([("source", source)])
+    with pytest.raises(ValueError, match="take_uid mismatch"):
+        aligned_endpoints(sources["source"], 0, row)
+
+
+def test_freeze_npy_source_contract_binds_rgb_transition_and_arrays(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = tmp_path / "source"
+    source.mkdir()
+    np.save(source / "ego.npy", np.zeros((2, 2, 8, 8, 3), dtype=np.uint8))
+    np.save(source / "exo.npy", np.ones((2, 2, 8, 8, 3), dtype=np.uint8))
+    np.save(source / "sample_id.npy", np.asarray(["a", "b"]))
+    np.save(source / "take_uid.npy", np.asarray(["ta", "tb"]))
+    np.save(source / "timestamp.npy", np.asarray([1.0, 2.0], dtype=np.float32))
+    producer = tmp_path / "producer.py"
+    producer.write_text(
+        "# cv2.COLOR_BGR2RGB\n# parser.add_argument('--transition-sec', default=0.5)\n",
+        encoding="utf-8",
+    )
+    contract = tmp_path / "contract.json"
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/freeze_fact_npy_source_contract.py",
+            "--input-dir",
+            str(source),
+            "--output-json",
+            str(contract),
+            "--producer-code",
+            str(producer),
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _, sources = load_sources([("source", source)])
+    validated = validate_source_contracts([("source", contract)], sources, canonical=True)
+    assert validated["source"]["sha256"]
+    payload = json.loads(contract.read_text(encoding="utf-8"))
+    assert payload["color_space"] == "RGB"
+    assert payload["endpoint_semantics"] == ["t", "t+0.5s"]
 
 
 def records(prefix: str, take_count: int, per_take: int) -> list[dict]:
@@ -78,6 +274,9 @@ def test_build_gold300_exact_counts_excludes_diagnostics_and_freezes(tmp_path: P
         assert len(rows) == expected
         assert {row["gold_split"] for row in rows} == {split}
         assert metadata["annotation_templates"][split]["rows"] == expected
+    guide = (tmp_path / "ANNOTATION_GUIDE.zh-CN.md").read_text(encoding="utf-8")
+    assert "FACT effect/contact 标注指南" in guide
+    assert "只依据 Ego 与 Exo 图像" in guide
 
 
 def test_gold_validation_and_kappa_gate() -> None:

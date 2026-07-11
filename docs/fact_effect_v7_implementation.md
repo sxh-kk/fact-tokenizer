@@ -61,6 +61,17 @@ The frozen numerical configuration is in
   trainer-quarantined effect manifest.
 - `scripts/prepare_fact_gold300.py` freezes 140/60/100 samples, excludes the
   500 diagnostics, and writes the 47 representation-training take exclusions.
+- `scripts/materialize_fact_gold300_review.py` joins the three frozen source
+  arrays by exact sample/take/time and renders lossless, opaque-ID Ego/Exo
+  endpoint sheets. Locked samples cannot share a pack with train/dev. Each run
+  atomically publishes three physically separate artifacts: admin mapping and
+  provenance, annotator A tasks, and dual-only annotator B tasks. Every
+  image/source/source-contract/freeze hash is recorded; weak, codelabel,
+  prediction, or pre-filled columns are rejected.
+- `scripts/freeze_fact_npy_source_contract.py` binds RGB color order,
+  `t/t+0.5s` endpoint semantics, shapes/dtypes, and all five source NPY hashes.
+  Filtered arrays can inherit the contract only after exact row-by-row parent
+  subset verification.
 - `scripts/validate_fact_gold300.py` requires both effect/contact Cohen kappa
   to reach 0.70 on the 60 dual-annotation rows.
 - `scripts/calibrate_fact_weak_semantics.py` is the only way to enable weak

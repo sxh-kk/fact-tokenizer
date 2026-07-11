@@ -8,3 +8,4 @@ pandas==2.2.3
 joblib==1.4.2
 pycocotools==2.0.10
 ijson==3.4.0.post0
+Pillow==11.2.1

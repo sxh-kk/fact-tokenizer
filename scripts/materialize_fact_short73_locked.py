@@ -75,6 +75,12 @@ def main() -> None:
     takes = {row["take_uid"]: row for row in load_jsonl(selected_path)}
     if len(samples) != 584 or len(takes) != 73:
         raise ValueError("short73 materialization requires exactly 73 takes and 584 samples")
+    transition_seconds = float(freeze.get("config", {}).get("transition_seconds", -1.0))
+    if transition_seconds != 0.5 or any(
+        abs((float(row["end_timestamp"]) - float(row["timestamp"])) - transition_seconds) > 1e-6
+        for row in samples
+    ):
+        raise ValueError("short73 source contract requires exact t→t+0.5s endpoints")
     by_take: dict[str, list[tuple[int, dict]]] = defaultdict(list)
     for index, sample in enumerate(samples):
         by_take[sample["take_uid"]].append((index, sample))
@@ -142,11 +148,15 @@ def main() -> None:
     ]
     write_manifest_jsonl(staging / "effect_manifest_locked.jsonl", locked_manifest)
     report = {
+        "schema": "fact-short73-materialization-v2",
         "locked_set_id": freeze["locked_set_id"],
         "samples": len(samples),
         "takes": len(takes),
         "shape": list(shape),
         "resize": args.resize,
+        "color_space": "RGB",
+        "transition_seconds": transition_seconds,
+        "endpoint_semantics": ["t", "t+0.5s"],
         "source_freeze_sha256": sha256_file(args.locked_dir / "freeze.json"),
         "array_sha256": {
             name: sha256_file(staging / f"{name}.npy")
@@ -159,6 +169,13 @@ def main() -> None:
                 "role",
                 "training_valid",
             )
+        },
+        "array_identity": {
+            name: {
+                "shape": list(np.load(staging / f"{name}.npy", mmap_mode="r", allow_pickle=False).shape),
+                "dtype": str(np.load(staging / f"{name}.npy", mmap_mode="r", allow_pickle=False).dtype),
+            }
+            for name in ("ego", "exo", "sample_id", "take_uid", "timestamp")
         },
         "final_inference_only": True,
         "freeze_stage": freeze_stage,

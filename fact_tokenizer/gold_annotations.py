@@ -230,20 +230,58 @@ def write_gold_pack(output_dir: Path | str, rows: Sequence[Mapping[str, Any]], s
         "annotation_templates": annotation_templates,
         "combined_annotation_csv_written": False,
     }
-    (output / "gold300_freeze.json").write_text(
+    guide_path = output / "ANNOTATION_GUIDE.zh-CN.md"
+    guide_temp = guide_path.with_suffix(guide_path.suffix + ".tmp")
+    guide_temp.write_text(
+        """# FACT effect/contact 标注指南
+
+## 基本原则
+
+- 只依据 Ego 与 Exo 图像中 `t → t+0.5s` 的可观察变化标注，不推断意图、物理因果或画面外状态。
+- `effect_label` 与 `contact_label` 必须独立判断；接触发生不等于已经产生可见 effect。
+- 不得查看或复制 atomic text、旧 codelabel、weak label 或模型预测。
+- `dual_annotation=True` 的样本由两位标注者独立完成，提交前不得协商。
+- 填写稳定的 `annotator_id`；不确定时按下述规则使用 `ambiguous`/`unknown`，不要猜测。
+
+## effect_label
+
+- `no_effect`：两个端点之间没有可确认的任务相关变化。
+- `approach_align`：手、工具或物体明显接近、瞄准或对齐，但尚未取得控制。
+- `acquire_control`：从未控制转为抓取、夹持、支撑或以工具稳定控制目标。
+- `state_change_or_manipulate`：出现可见的内部状态、构型或操作变化，如切、开、关、旋、搅、按压。
+- `transport_reposition`：已受控目标发生明显搬运、平移、重定位或放置过程中的位移。
+- `release_complete`：控制或接触明确结束，目标已被释放、放下或操作完成。
+- `recover_abort`：动作中止、失败、撤回、掉落、重新尝试或恢复。
+- `ambiguous`：至少两个 effect 类别同样合理，或关键视觉证据不足；必须填写 `ambiguous_reason`。
+
+## contact_label
+
+- `none`：没有可见接触。
+- `onset`：区间内从未接触转为接触。
+- `stable`：区间两端均保持接触或控制。
+- `release`：区间内从接触转为分离。
+- `unknown`：遮挡、画质或视角使接触阶段无法可靠判断。
+
+## 提交检查
+
+- 不修改 `sample_id`、`take_uid`、`gold_split`、时间戳或冻结字段。
+- `effect_label=ambiguous` 时填写 `ambiguous_reason`；其他类别可留空。
+- `locked_test` 标签只供最终一次性评估，禁止用于阈值、模型、loss 权重或 checkpoint 选择。
+""",
+        encoding="utf-8",
+    )
+    guide_temp.replace(guide_path)
+    metadata["annotation_guide"] = {
+        "path": guide_path.name,
+        "sha256": hashlib.sha256(guide_path.read_bytes()).hexdigest(),
+    }
+    freeze_path = output / "gold300_freeze.json"
+    freeze_temp = freeze_path.with_suffix(freeze_path.suffix + ".tmp")
+    freeze_temp.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    (output / "ANNOTATION_GUIDE.zh-CN.md").write_text(
-        "# FACT effect/contact 标注指南\n\n"
-        "每条样本分别填写 `effect_label` 与 `contact_label`。effect 可选：\n\n- "
-        + "\n- ".join(EFFECT_LABELS)
-        + "\n\ncontact 可选：\n\n- "
-        + "\n- ".join(CONTACT_LABELS)
-        + "\n\n看不清或存在多个同等合理解释时使用 `ambiguous`，并填写 `ambiguous_reason`。"
-        "不要从 weak text、旧 codelabel 或模型预测复制标签。\n",
-        encoding="utf-8",
-    )
+    freeze_temp.replace(freeze_path)
     return metadata
 
 
