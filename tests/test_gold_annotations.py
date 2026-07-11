@@ -18,6 +18,18 @@ from fact_tokenizer.gold_annotations import (
 )
 
 
+@pytest.mark.parametrize("script", ["prepare_fact_gold300.py", "validate_fact_gold300.py"])
+def test_gold_cli_bootstraps_repo_imports(script: str) -> None:
+    completed = subprocess.run(
+        [sys.executable, f"scripts/{script}", "--help"],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "usage:" in completed.stdout
+
+
 def records(prefix: str, take_count: int, per_take: int) -> list[dict]:
     return [
         {
