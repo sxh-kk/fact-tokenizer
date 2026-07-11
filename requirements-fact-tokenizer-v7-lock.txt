@@ -1,0 +1,11 @@
+-r requirements-fact-tokenizer.txt
+
+# Server-verified FACT v7 additions (Python 3.10, 2026-07-11).
+pytest==8.3.5
+scipy==1.13.1
+scikit-learn==1.5.2
+pandas==2.2.3
+joblib==1.4.2
+pycocotools==2.0.10
+ijson==3.4.0.post0
+Pillow==11.2.1

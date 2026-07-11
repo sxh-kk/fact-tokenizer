@@ -20,6 +20,8 @@ ANNOTATION_COLUMNS = [
     "exo_body_visibility",
     "object_interaction",
     "phase_diversity",
+    "scene_only_risk",
+    "ego_exo_sync_quality",
     "usable_for",
     "notes",
 ]
