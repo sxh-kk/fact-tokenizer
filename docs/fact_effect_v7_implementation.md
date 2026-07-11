@@ -43,9 +43,12 @@ legacy filtered arrays is diagnostic-only and must be rebuilt.
    `scripts/index_fact_sparse_pose_anchors.py`.
 6. Freeze a 50-row quality/pose/mask-stratified audit selection with
    `scripts/select_fact_target_audit_samples.py`, then build only those rows
-   with `scripts/build_fact_effect_targets.py --sample-index-npy ...`.
+   with `scripts/build_fact_effect_targets.py --sample-index-npy ...
+   --sample-index-contract .../audit_selection.json`.
 7. Create and review the visualization pack with
    `scripts/audit_fact_effect_targets.py`. Validation emits a cache-identity
+   bound gate. Every later formal full cache or shard must supply that gate;
+   only the hash-bound 50-row audit selection may be built before it.
    bound gate only after at least 45/50 rows pass all alignment checks.
 8. Build the full formal cache with `--visual-audit-gate ...`. A full formal
    build fails without that gate. Independent shards are merged only through

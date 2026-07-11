@@ -395,6 +395,7 @@ def main() -> None:
                 raise ValueError("sample-index contract does not bind this manifest selection")
             selection_provenance.update(
                 {
+                    "schema": selection["schema"],
                     "selection_contract": str(args.sample_index_contract.resolve()),
                     "selection_contract_sha256": sha256_file(args.sample_index_contract),
                 }
@@ -528,22 +529,29 @@ def main() -> None:
             ),
         },
     }
-    writer = EffectTargetCacheWriter(
-        args.output_dir,
-        config,
-        resume=args.resume,
-        identity=build_provenance,
+    cache_identity = {
+        key: value for key, value in build_provenance.items() if key != "selection_contract"
+    }
+    normalized_identity = json.loads(json.dumps(cache_identity, sort_keys=True))
+    expected_identity_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "config_sha256": config.fingerprint(),
+                "sources": normalized_identity,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    pre_gate_audit_cache = bool(
+        selection_provenance
+        and selection_provenance.get("schema") == "fact-target-audit-selection-v1"
     )
-    full_formal_cache = (
-        not args.allow_smoke_targets
-        and args.sample_index_npy is None
-        and args.start == 0
-        and args.limit is None
-    )
+    formal_gate_required = not args.allow_smoke_targets and not pre_gate_audit_cache
     formal_release = None
-    if full_formal_cache:
+    if formal_gate_required:
         if args.visual_audit_gate is None:
-            raise ValueError("full formal target cache requires --visual-audit-gate")
+            raise ValueError("formal target cache or shard requires --visual-audit-gate")
         gate = json.loads(args.visual_audit_gate.read_text(encoding="utf-8"))
         if (
             gate.get("passed") is not True
@@ -553,7 +561,7 @@ def main() -> None:
             or float(gate.get("pass_fraction", 0.0)) < 0.90
         ):
             raise ValueError("visual audit gate must contain 50 reviewed rows and passed=true")
-        if gate.get("target_identity_sha256") != writer.identity_sha256:
+        if gate.get("target_identity_sha256") != expected_identity_sha256:
             raise ValueError("visual audit gate was produced from a different target source/weight identity")
         formal_release = {
             "visual_audit_gate_sha256": sha256_file(args.visual_audit_gate),
@@ -561,6 +569,16 @@ def main() -> None:
             "pass_fraction": float(gate["pass_fraction"]),
             "target_identity_sha256": gate["target_identity_sha256"],
         }
+    writer = EffectTargetCacheWriter(
+        args.output_dir,
+        config,
+        resume=args.resume,
+        identity=cache_identity,
+    )
+    if writer.identity_sha256 != expected_identity_sha256:
+        raise AssertionError("target cache identity calculation drifted")
+    build_provenance["target_identity_sha256"] = writer.identity_sha256
+    build_provenance["formal_release"] = formal_release
     (args.output_dir / "builder_provenance.json").write_text(
         json.dumps(build_provenance, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
