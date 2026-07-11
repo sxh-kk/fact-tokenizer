@@ -78,6 +78,40 @@ images/
 
 `task.csv` 只有 opaque `review_id`、图片路径和五个可编辑字段，不包含 `sample_id`、`take_uid`、split、任务名、弱标签或模型预测。
 
+### 3.1 正式交付前的 non-locked pilot
+
+在冻结正式指南前，先从未进入 gold 的 heldout takes 生成 24 条 A/B 重叠 pilot：
+
+```bash
+python scripts/prepare_fact_gold300_pilot.py \
+  --candidates <HELDOUT_BASE_MANIFEST.jsonl> \
+  --gold-manifest <GOLD_ROOT>/gold300_frozen.jsonl \
+  --annotation-guide docs/fact_gold300_annotator_guide.zh-CN.md \
+  --count 24 \
+  --seed 20260711 \
+  --output-dir <PILOT_ROOT>/selection
+```
+
+该脚本会排除正式 gold 的全部 sample ID 和 take UID，从 24 个不同的 heldout takes 各选一个确定性中位 transition。pilot freeze 明确禁止用于 encoder、linear probe、模型选择、正式评价或 locked test。
+
+然后用现有 materializer 生成两个公开 pilot 包和一个管理员包：
+
+```bash
+python scripts/materialize_fact_gold300_review.py \
+  --gold-manifest <PILOT_ROOT>/selection/pilot_frozen.jsonl \
+  --gold-freeze <PILOT_ROOT>/selection/pilot_freeze.json \
+  --include-split calibration_dev \
+  --source heldout=<HELDOUT_NPY_DIR> \
+  --annotation-template <PILOT_ROOT>/selection/pilot_annotations.csv \
+  --annotation-guide docs/fact_gold300_annotator_guide.zh-CN.md \
+  --admin-output-dir <PILOT_ROOT>/admin \
+  --annotator-a-output-dir <PILOT_ROOT>/annotator_a \
+  --annotator-b-output-dir <PILOT_ROOT>/annotator_b \
+  --allow-noncanonical-count
+```
+
+pilot 不使用 formal source contract，因为它选择的是未进入正式 gold/raw-frame audit 的 heldout 样本；materializer 仍会绑定完整 NPY 文件、所选 RGB 内容、manifest、模板和指南 hash。A/B 都独立完成 24 条后才讨论类别边界。若修改指南，必须重新冻结 gold 并重新生成正式 v2 包；pilot 标签不得复制进正式提交。
+
 ## 4. train/dev 与 locked 必须分开生成
 
 train/dev 可在同一次命令中生成；locked 必须单独生成到不同的 admin、A、B 目录。下面使用占位路径，实际运行时替换尖括号内容。

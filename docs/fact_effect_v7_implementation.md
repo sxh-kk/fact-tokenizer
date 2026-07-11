@@ -78,6 +78,10 @@ The frozen numerical configuration is in
   trainer-quarantined effect manifest.
 - `scripts/prepare_fact_gold300.py` freezes 140/60/100 samples, excludes the
   500 diagnostics, and writes the 47 representation-training take exclusions.
+- `scripts/prepare_fact_gold300_pilot.py` deterministically selects one sample
+  from each of 24 non-gold heldout takes for A/B guide calibration. Its freeze
+  explicitly forbids encoder, probe, model-selection, formal-evaluation, and
+  locked-test use.
 - `scripts/materialize_fact_gold300_review.py` joins the three frozen source
   arrays by exact sample/take/time and renders lossless, opaque-ID Ego/Exo
   endpoint sheets. Locked samples cannot share a pack with train/dev. Each run
