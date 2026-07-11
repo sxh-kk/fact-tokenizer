@@ -389,7 +389,11 @@ def _validate_source_contract_recursive(
             parent_path, parent_dir, seen=seen
         )
         indices_raw = np.load(row_index_path, mmap_mode="r", allow_pickle=False)
-        if indices_raw.ndim != 1 or not np.issubdtype(indices_raw.dtype, np.integer):
+        if (
+            indices_raw.ndim != 1
+            or not np.issubdtype(indices_raw.dtype, np.integer)
+            or evidence.get("source_row_index_dtype") != str(indices_raw.dtype)
+        ):
             raise ValueError("source subset row index must retain an integer dtype")
         indices = np.asarray(indices_raw, dtype=np.int64)
         if (
@@ -400,6 +404,11 @@ def _validate_source_contract_recursive(
         ):
             raise ValueError("source subset row index is not a valid one-to-one mapping")
         for name in CORE_SOURCE_ARRAYS:
+            if (
+                arrays[name].dtype != parent_arrays[name].dtype
+                or arrays[name].shape[1:] != parent_arrays[name].shape[1:]
+            ):
+                raise ValueError(f"source subset {name}.npy dtype/row shape differs from its parent")
             for start in range(0, len(indices), 64):
                 selection = indices[start : start + 64]
                 if not np.array_equal(

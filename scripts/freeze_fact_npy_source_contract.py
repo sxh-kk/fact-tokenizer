@@ -188,12 +188,19 @@ def validate_parent_subset(
     ):
         raise ValueError("parent contract no longer matches parent NPY files")
     indices = np.load(row_index_path, mmap_mode="r", allow_pickle=False)
-    if indices.ndim != 1 or len(indices) != len(arrays["sample_id"]):
-        raise ValueError("source_row_index must align one-to-one with the filtered source")
+    if (
+        indices.ndim != 1
+        or len(indices) != len(arrays["sample_id"])
+        or not np.issubdtype(indices.dtype, np.integer)
+    ):
+        raise ValueError("source_row_index must be an integer vector aligned one-to-one with the source")
+    source_row_index_dtype = str(indices.dtype)
     indices = np.asarray(indices, dtype=np.int64)
     if len(np.unique(indices)) != len(indices) or (indices < 0).any() or (indices >= len(parent_arrays["sample_id"])).any():
         raise ValueError("source_row_index contains duplicate or out-of-range rows")
     for name in CORE_ARRAYS:
+        if arrays[name].dtype != parent_arrays[name].dtype or arrays[name].shape[1:] != parent_arrays[name].shape[1:]:
+            raise ValueError(f"filtered source {name}.npy dtype/row shape differs from its parent")
         for start in range(0, len(indices), 64):
             selected = np.asarray(parent_arrays[name][indices[start : start + 64]])
             current = np.asarray(arrays[name][start : start + len(selected)])
@@ -209,6 +216,7 @@ def validate_parent_subset(
         "parent_contract_sha256": sha256_file(parent_contract_path),
         "source_row_index": str(row_index_path),
         "source_row_index_sha256": sha256_file(row_index_path),
+        "source_row_index_dtype": source_row_index_dtype,
     }
     current_ids = {str(value) for value in arrays["sample_id"]}
     audited_ids = sorted(current_ids & set(parent_contract.get("audited_sample_ids", [])))

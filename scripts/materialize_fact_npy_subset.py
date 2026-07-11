@@ -88,7 +88,10 @@ def main() -> None:
         for name in ("sample_id", "take_uid", "timestamp")
     }
     for name, array in reference.items():
-        if not np.array_equal(array, parent[name][indices]):
+        parent_rows = parent[name][indices]
+        if array.dtype != parent[name].dtype or array.shape != parent_rows.shape:
+            raise ValueError(f"metadata reference {name}.npy dtype/shape differs from indexed parent rows")
+        if not np.array_equal(array, parent_rows):
             raise ValueError(f"metadata reference {name}.npy does not equal indexed parent rows")
     args.output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = args.output_dir.parent / f".{args.output_dir.name}.staging-{uuid.uuid4().hex}"
@@ -108,7 +111,7 @@ def main() -> None:
             np.save(staging / f"{name}.npy", np.asarray(array))
         np.save(
             staging / "frame_index.npy",
-            np.asarray(parent_frame_index[indices], dtype=np.int64),
+            np.asarray(parent_frame_index[indices]),
         )
         files = {name: identity(staging, name) for name in CORE_ARRAYS}
         report = {
