@@ -153,7 +153,11 @@ def main() -> None:
         )
         if (
             materialization_report.get("schema")
-            not in {"fact-npy-transition-rebuild-v1", "fact-npy-transition-subset-v1"}
+            not in {
+                "fact-npy-transition-rebuild-v1",
+                "fact-npy-transition-subset-v1",
+                "fact-short73-materialization-v3",
+            }
             or
             materialization_report.get("files") != files
             or materialization_report.get("frame_index") != frame_index_identity
