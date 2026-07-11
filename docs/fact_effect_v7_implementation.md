@@ -84,15 +84,24 @@ The frozen numerical configuration is in
   atomically publishes three physically separate artifacts: admin mapping and
   provenance, annotator A tasks, and dual-only annotator B tasks. Every
   image/source/source-contract/freeze hash is recorded; weak, codelabel,
-  prediction, or pre-filled columns are rejected.
+  prediction, or pre-filled columns are rejected. Public delivery v2 also
+  carries a role-specific quickstart, the frozen guide, an immutable blank
+  template, and a standalone public-submission validator.
+- `scripts/import_fact_gold300_submissions.py` is the admin-only bridge from
+  opaque review IDs back to canonical sample IDs. It binds both deliveries to
+  the sealed mapping hash, requires exact A/B and dual-only coverage, refuses
+  mixed locked/non-locked imports, publishes split-specific canonical CSVs
+  atomically, and keeps locked outputs private on POSIX.
 - `scripts/freeze_fact_npy_source_contract.py` binds RGB color order,
   `t/t+0.5s` endpoint semantics, shapes/dtypes, and all five source NPY hashes.
   A root contract requires a passed `audit_fact_npy_source_semantics.py`
   report: every selected gold endpoint is decoded again from its hash-bound
   raw Ego/Exo video and must match the NPY exactly. Filtered arrays can inherit
   a parent contract only after exact row-by-row subset verification.
-- `scripts/validate_fact_gold300.py` requires both effect/contact Cohen kappa
-  to reach 0.70 on the 60 dual-annotation rows.
+- `scripts/validate_fact_gold300.py` can aggregate physically separated
+  non-locked and locked canonical files without writing a mixed CSV and
+  requires both effect/contact Cohen kappa to reach 0.70 on exactly 60
+  dual-annotation rows.
 - `scripts/calibrate_fact_weak_semantics.py` is the only way to enable weak
   phase/contact targets. It binds the deterministic verb map to all 60 dev
   rows and requires both measured precisions to reach 0.80.

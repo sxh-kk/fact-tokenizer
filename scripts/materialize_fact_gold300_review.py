@@ -547,20 +547,72 @@ def build_delivery_artifact(
         )
     task_path = staging / "task.csv"
     shutil.copy2(task_source, task_path)
-    guide_path = staging / guide.name
+    task_template_path = staging / "task.template.csv"
+    shutil.copy2(task_source, task_template_path)
+    guide_path = staging / "ANNOTATION_GUIDE.zh-CN.md"
     shutil.copy2(guide, guide_path)
+    quickstart_path = staging / "README_FIRST.zh-CN.md"
+    role_name = "标注者 A（完成本包全部任务）"
+    independence = "不要查看或讨论标注者 B 的逐样本答案。"
+    if role == "annotator_b_dual_only":
+        role_name = "标注者 B（只完成本包中的独立复标任务）"
+        independence = "这些任务与 A 有重叠；提交前不得查看或讨论 A 的逐样本答案。"
+    quickstart_path.write_text(
+        f"""# 请先阅读：FACT v7 gold 标注包
+
+你的角色：{role_name}
+
+本包任务数：{len(public_inventory)}
+
+1. 先完整阅读 `{guide_path.name}`。
+2. 只编辑 `task.csv`；`task.template.csv` 是只读原始模板。
+3. 通过 `image` 列打开 `images/` 中对应的四宫格图片。
+4. 每行独立填写 `effect_label`、`contact_label`、必要时的 `ambiguous_reason`、稳定的 `annotator_id` 和可选 `notes`。
+5. 不修改 `review_id`、`image`、列名或其他交付文件；不要增删行。
+6. {independence}
+7. 完成后在本目录运行：
+
+```text
+python validate_submission.py --submission task.csv --template task.template.csv --delivery-manifest delivery_manifest.json --output-report submission_validation_report.json
+```
+
+只有校验报告显示 `\"passed\": true` 才能提交。把 `task.csv` 和 `submission_validation_report.json` 交给指定数据管理员，不要交给模型开发人员或上传到公开位置。
+""",
+        encoding="utf-8",
+    )
+    validator_source = ROOT / "scripts" / "validate_fact_gold300_submission.py"
+    if not validator_source.is_file():
+        raise FileNotFoundError(f"missing public submission validator: {validator_source}")
+    validator_path = staging / "validate_submission.py"
+    shutil.copy2(validator_source, validator_path)
     inventory_path = staging / "image_inventory.jsonl"
     inventory_path.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in public_inventory),
         encoding="utf-8",
     )
     report = {
-        "schema": "fact-gold300-annotator-delivery-v1",
+        "schema": "fact-gold300-annotator-delivery-v2",
         "artifact_role": role,
         "tasks": len(public_inventory),
         "task_sha256": sha256_file(task_path),
+        "task_template_path": task_template_path.name,
+        "task_template_sha256": sha256_file(task_template_path),
         "image_inventory_sha256": sha256_file(inventory_path),
+        "annotation_guide_path": guide_path.name,
         "annotation_guide_sha256": sha256_file(guide_path),
+        "quickstart_path": quickstart_path.name,
+        "quickstart_sha256": sha256_file(quickstart_path),
+        "submission_validator_path": validator_path.name,
+        "submission_validator_sha256": sha256_file(validator_path),
+        "immutable_fields": ["review_id", "image"],
+        "editable_fields": [
+            "effect_label",
+            "contact_label",
+            "ambiguous_reason",
+            "annotator_id",
+            "notes",
+        ],
+        "expected_return_files": ["task.csv", "submission_validation_report.json"],
         "admin_binding": binding,
         "contains_frozen_sample_mapping": False,
         "contains_other_annotator_task": False,
@@ -768,6 +820,7 @@ def main() -> None:
             "gold_manifest_sha256": sha256_file(args.gold_manifest),
             "selected_ego_exo_content_sha256": selected_digest.hexdigest(),
             "review_id_nonce_sha256": hashlib.sha256(nonce).hexdigest(),
+            "sealed_mapping_sha256": sha256_file(mapping_path),
         }
         report = {
             "schema": "fact-gold300-review-admin-v1",
