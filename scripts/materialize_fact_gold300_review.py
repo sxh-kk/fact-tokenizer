@@ -194,6 +194,23 @@ def load_sources(values: list[tuple[str, Path]]) -> tuple[dict[str, tuple[str, i
                 raise ValueError(f"formal review source {name}/{view} must be uint8, got {array.dtype}")
         if arrays["take_uid"].ndim != 1 or arrays["timestamp"].ndim != 1:
             raise ValueError(f"source metadata for {name} must be one-dimensional")
+        frame_index_path = directory / "frame_index.npy"
+        frame_indices = None
+        frame_index_identity = None
+        if frame_index_path.is_file():
+            frame_indices = np.load(frame_index_path, mmap_mode="r", allow_pickle=False)
+            if (
+                frame_indices.ndim != 1
+                or len(frame_indices) != lengths["sample_id"]
+                or not np.issubdtype(frame_indices.dtype, np.integer)
+                or (frame_indices < 0).any()
+            ):
+                raise ValueError(f"source frame_index.npy for {name} is invalid")
+            frame_index_identity = {
+                "sha256": sha256_file(frame_index_path),
+                "shape": list(frame_indices.shape),
+                "dtype": str(frame_indices.dtype),
+            }
         for index, raw_id in enumerate(arrays["sample_id"]):
             sample_id = text(raw_id)
             if sample_id in lookup:
@@ -204,6 +221,8 @@ def load_sources(values: list[tuple[str, Path]]) -> tuple[dict[str, tuple[str, i
             "directory": directory,
             "arrays": arrays,
             "rows": lengths["sample_id"],
+            "frame_indices": frame_indices,
+            "frame_index": frame_index_identity,
             "files": {
                 key: {
                     "sha256": sha256_file(directory / f"{key}.npy"),
@@ -246,6 +265,11 @@ def validate_source_contracts(
             raise ValueError(f"source contract endpoint semantics mismatch for {name}")
         if int(payload.get("rows", -1)) != source["rows"] or payload.get("files") != source["files"]:
             raise ValueError(f"source contract files do not match current NPY content for {name}")
+        if canonical and (
+            source["frame_index"] is None
+            or payload.get("frame_index") != source["frame_index"]
+        ):
+            raise ValueError(f"canonical source contract does not bind frame_index.npy for {name}")
         audited_ids = [str(value) for value in payload.get("audited_sample_ids", [])]
         audited_hash = hashlib.sha256(
             "".join(value + "\n" for value in sorted(audited_ids)).encode("utf-8")
@@ -272,8 +296,50 @@ def validate_source_contracts(
                 or sorted(str(value) for value in report.get("audited_sample_ids", [])) != sorted(audited_ids)
                 or report.get("color_space") != "RGB"
                 or float(report.get("transition_seconds", -1.0)) != 0.5
+                or report.get("frame_selection_mode") != "frozen_frame_index_sidecar"
+                or float(report.get("frame_rate_hz", -1.0)) != 30.0
+                or int(report.get("endpoint_offset_frames", -1)) != 15
+                or report.get("frame_index") != source["frame_index"]
+                or Path(report.get("frame_index_npy", "")).resolve()
+                != (source["directory"] / "frame_index.npy").resolve()
+                or int(report.get("exact_view_pair_matches", -1)) != 2 * len(audited_ids)
+                or float(report.get("maximum_t0_timestamp_distance_frames", 999.0)) > 0.501
             ):
                 raise ValueError(f"source semantic report content mismatch for {name}")
+            materialization_report = source["directory"] / "materialization_report.json"
+            if (
+                not materialization_report.is_file()
+                or Path(report.get("materialization_report", "")).resolve()
+                != materialization_report.resolve()
+                or report.get("materialization_report_sha256")
+                != sha256_file(materialization_report)
+            ):
+                raise ValueError(f"source semantic materialization evidence mismatch for {name}")
+            frame_rows = report.get("audited_frame_rows", [])
+            frame_rows_text = "".join(
+                f"{row.get('sample_id')}\t{row.get('take_uid')}\t{row.get('frame_index')}\n"
+                for row in frame_rows
+            )
+            source_lookup = {
+                text(value): index for index, value in enumerate(source["arrays"]["sample_id"])
+            }
+            if (
+                len(frame_rows) != len(audited_ids)
+                or [str(row.get("sample_id")) for row in frame_rows] != sorted(audited_ids)
+                or report.get("audited_frame_rows_sha256")
+                != hashlib.sha256(frame_rows_text.encode("utf-8")).hexdigest()
+            ):
+                raise ValueError(f"source semantic frame mapping mismatch for {name}")
+            for row in frame_rows:
+                sample_id = str(row["sample_id"])
+                index = source_lookup.get(sample_id)
+                if (
+                    index is None
+                    or str(row.get("take_uid")) != text(source["arrays"]["take_uid"][index])
+                    or int(row.get("frame_index", -1))
+                    != int(source["frame_indices"][index])
+                ):
+                    raise ValueError(f"source semantic frame row differs for {name}/{sample_id}")
         validated[name] = {
             "path": str(path),
             "sha256": sha256_file(path),

@@ -14,6 +14,12 @@ import numpy as np
 CORE_ARRAYS = ("ego", "exo", "sample_id", "take_uid", "timestamp")
 
 
+def as_text(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, required=True)
@@ -62,11 +68,32 @@ def inspect_source(directory: Path) -> tuple[dict[str, np.ndarray], dict[str, di
     return arrays, files
 
 
+def inspect_frame_index(directory: Path, rows: int) -> tuple[np.ndarray, dict]:
+    path = directory / "frame_index.npy"
+    array = np.load(path, mmap_mode="r", allow_pickle=False)
+    if (
+        array.ndim != 1
+        or len(array) != rows
+        or not np.issubdtype(array.dtype, np.integer)
+        or (array < 0).any()
+    ):
+        raise ValueError("frame_index.npy must be a nonnegative integer vector aligned to source rows")
+    identity = {
+        "sha256": sha256_file(path),
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+    }
+    return array, identity
+
+
 def validate_direct_evidence(
     code_paths: list[Path],
     report_path: Path | None,
     source_dir: Path,
+    arrays: dict[str, np.ndarray],
     files: dict[str, dict],
+    frame_indices: np.ndarray,
+    frame_index_identity: dict,
 ) -> tuple[dict, list[str]]:
     if report_path is None:
         raise ValueError("direct source contract requires an empirical --producer-report")
@@ -81,6 +108,21 @@ def validate_direct_evidence(
         raise ValueError("producer report does not declare 0.5 seconds")
     if report.get("endpoint_semantics") != ["t", "t+0.5s"]:
         raise ValueError("producer report endpoint semantics mismatch")
+    materialization_report = source_dir / "materialization_report.json"
+    if (
+        report.get("frame_selection_mode") != "frozen_frame_index_sidecar"
+        or float(report.get("frame_rate_hz", -1.0)) != 30.0
+        or int(report.get("endpoint_offset_frames", -1)) != 15
+        or Path(report.get("frame_index_npy", "")).resolve()
+        != (source_dir / "frame_index.npy").resolve()
+        or report.get("frame_index") != frame_index_identity
+        or not materialization_report.is_file()
+        or Path(report.get("materialization_report", "")).resolve()
+        != materialization_report.resolve()
+        or report.get("materialization_report_sha256") != sha256_file(materialization_report)
+        or float(report.get("maximum_t0_timestamp_distance_frames", 999.0)) > 0.501
+    ):
+        raise ValueError("producer report lacks a valid exact-frame sidecar contract")
     audited_ids = [str(value) for value in report.get("audited_sample_ids", [])]
     expected_ids_hash = hashlib.sha256("".join(value + "\n" for value in sorted(audited_ids)).encode()).hexdigest()
     if (
@@ -91,17 +133,44 @@ def validate_direct_evidence(
         or int(report.get("exact_view_pair_matches", -1)) != 2 * len(audited_ids)
     ):
         raise ValueError("producer report has an invalid audited-sample identity contract")
+    frame_rows = report.get("audited_frame_rows", [])
+    frame_rows_text = "".join(
+        f"{row.get('sample_id')}\t{row.get('take_uid')}\t{row.get('frame_index')}\n"
+        for row in frame_rows
+    )
+    source_lookup = {as_text(value): index for index, value in enumerate(arrays["sample_id"])}
+    if (
+        len(frame_rows) != len(audited_ids)
+        or [str(row.get("sample_id")) for row in frame_rows] != sorted(audited_ids)
+        or report.get("audited_frame_rows_sha256")
+        != hashlib.sha256(frame_rows_text.encode("utf-8")).hexdigest()
+    ):
+        raise ValueError("producer report has an invalid audited frame mapping digest")
+    for row in frame_rows:
+        sample_id = str(row["sample_id"])
+        index = source_lookup.get(sample_id)
+        if (
+            index is None
+            or str(row.get("take_uid")) != as_text(arrays["take_uid"][index])
+            or int(row.get("frame_index", -1)) != int(frame_indices[index])
+        ):
+            raise ValueError(f"producer frame mapping differs from source sidecar for {sample_id}")
     evidence: dict = {
         "mode": "semantic_audit_against_raw_videos",
         "producer_report": str(report_path),
         "producer_report_sha256": sha256_file(report_path),
         "producer_code_sha256": {str(path): sha256_file(path) for path in code_paths},
+        "frame_index_sha256": frame_index_identity["sha256"],
     }
     return evidence, sorted(audited_ids)
 
 
 def validate_parent_subset(
-    arrays: dict[str, np.ndarray], parent_contract_path: Path, row_index_path: Path
+    arrays: dict[str, np.ndarray],
+    frame_indices: np.ndarray,
+    frame_index_identity: dict,
+    parent_contract_path: Path,
+    row_index_path: Path,
 ) -> tuple[dict, dict, list[str]]:
     parent_contract = json.loads(parent_contract_path.read_text(encoding="utf-8"))
     if parent_contract.get("schema") != "fact-npy-source-contract-v1":
@@ -110,7 +179,13 @@ def validate_parent_subset(
         raise ValueError("parent source semantics mismatch")
     parent_dir = Path(parent_contract["source_dir"])
     parent_arrays, parent_files = inspect_source(parent_dir)
-    if parent_files != parent_contract.get("files"):
+    parent_frame_indices, parent_frame_identity = inspect_frame_index(
+        parent_dir, len(parent_arrays["sample_id"])
+    )
+    if (
+        parent_files != parent_contract.get("files")
+        or parent_frame_identity != parent_contract.get("frame_index")
+    ):
         raise ValueError("parent contract no longer matches parent NPY files")
     indices = np.load(row_index_path, mmap_mode="r", allow_pickle=False)
     if indices.ndim != 1 or len(indices) != len(arrays["sample_id"]):
@@ -124,6 +199,10 @@ def validate_parent_subset(
             current = np.asarray(arrays[name][start : start + len(selected)])
             if not np.array_equal(current, selected):
                 raise ValueError(f"filtered source {name}.npy differs from parent rows at {start}")
+    if not np.array_equal(frame_indices, parent_frame_indices[indices]):
+        raise ValueError("filtered source frame_index.npy differs from indexed parent rows")
+    if frame_index_identity["shape"] != [len(indices)]:
+        raise ValueError("filtered frame-index identity has an invalid shape")
     evidence = {
         "mode": "exact_parent_row_subset",
         "parent_contract": str(parent_contract_path),
@@ -143,11 +222,16 @@ def main() -> None:
     if args.output_json.exists():
         raise FileExistsError(f"refusing to overwrite source contract: {args.output_json}")
     arrays, files = inspect_source(args.input_dir)
+    frame_indices, frame_index_identity = inspect_frame_index(
+        args.input_dir, len(arrays["sample_id"])
+    )
     if (args.parent_contract is None) != (args.source_row_index is None):
         raise ValueError("--parent-contract and --source-row-index must be supplied together")
     if args.parent_contract is not None:
         producer_evidence, parent, audited_sample_ids = validate_parent_subset(
             arrays,
+            frame_indices,
+            frame_index_identity,
             args.parent_contract,
             args.source_row_index,
         )
@@ -157,7 +241,10 @@ def main() -> None:
             args.producer_code,
             args.producer_report,
             args.input_dir,
+            arrays,
             files,
+            frame_indices,
+            frame_index_identity,
         )
     contract = {
         "schema": "fact-npy-source-contract-v1",
@@ -167,6 +254,7 @@ def main() -> None:
         "transition_seconds": 0.5,
         "endpoint_semantics": ["t", "t+0.5s"],
         "files": files,
+        "frame_index": frame_index_identity,
         "audited_sample_ids": audited_sample_ids,
         "audited_sample_ids_sha256": hashlib.sha256(
             "".join(value + "\n" for value in audited_sample_ids).encode("utf-8")

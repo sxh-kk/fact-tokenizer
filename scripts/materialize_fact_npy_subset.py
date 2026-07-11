@@ -50,6 +50,8 @@ def main() -> None:
         or parent_report.get("color_space") != "RGB"
         or float(parent_report.get("transition_seconds", -1.0)) != 0.5
         or parent_report.get("endpoint_semantics") != ["t", "t+0.5s"]
+        or float(parent_report.get("frame_rate_hz", -1.0)) != 30.0
+        or int(parent_report.get("endpoint_offset_frames", -1)) != 15
     ):
         raise ValueError("parent is not a verified RGB t→t+0.5s rebuild")
     parent = {
@@ -58,6 +60,17 @@ def main() -> None:
     }
     if parent_report.get("files") != {name: identity(args.parent_dir, name) for name in CORE_ARRAYS}:
         raise ValueError("parent materialization report no longer matches its arrays")
+    parent_frame_index = np.load(
+        args.parent_dir / "frame_index.npy", mmap_mode="r", allow_pickle=False
+    )
+    if (
+        parent_frame_index.ndim != 1
+        or len(parent_frame_index) != len(parent["sample_id"])
+        or not np.issubdtype(parent_frame_index.dtype, np.integer)
+        or (parent_frame_index < 0).any()
+        or parent_report.get("frame_index") != identity(args.parent_dir, "frame_index")
+    ):
+        raise ValueError("parent frame_index.npy is missing, invalid, or no longer hash-bound")
     indices = np.load(args.row_index_npy, mmap_mode="r", allow_pickle=False)
     if indices.ndim != 1:
         raise ValueError("row index must be one-dimensional")
@@ -87,6 +100,10 @@ def main() -> None:
             del output
         for name, array in reference.items():
             np.save(staging / f"{name}.npy", np.asarray(array))
+        np.save(
+            staging / "frame_index.npy",
+            np.asarray(parent_frame_index[indices], dtype=np.int64),
+        )
         files = {name: identity(staging, name) for name in CORE_ARRAYS}
         report = {
             "schema": "fact-npy-transition-subset-v1",
@@ -99,6 +116,9 @@ def main() -> None:
             "color_space": "RGB",
             "transition_seconds": 0.5,
             "endpoint_semantics": ["t", "t+0.5s"],
+            "frame_rate_hz": 30.0,
+            "endpoint_offset_frames": 15,
+            "frame_index": identity(staging, "frame_index"),
             "files": files,
             "subset_code_sha256": sha256_file(Path(__file__)),
         }

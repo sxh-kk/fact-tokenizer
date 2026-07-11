@@ -197,8 +197,33 @@ def test_freeze_npy_source_contract_binds_rgb_transition_and_arrays(tmp_path: Pa
     np.save(source / "sample_id.npy", np.asarray(["a", "b"]))
     np.save(source / "take_uid.npy", np.asarray(["ta", "tb"]))
     np.save(source / "timestamp.npy", np.asarray([1.0, 2.0], dtype=np.float32))
+    np.save(source / "frame_index.npy", np.asarray([30, 60], dtype=np.int64))
     _, sources = load_sources([("source", source)])
+    materialization_report = source / "materialization_report.json"
+    materialization_report.write_text(
+        json.dumps(
+            {
+                "schema": "fact-npy-transition-rebuild-v1",
+                "files": sources["source"]["files"],
+                "frame_index": sources["source"]["frame_index"],
+                "color_space": "RGB",
+                "transition_seconds": 0.5,
+                "endpoint_semantics": ["t", "t+0.5s"],
+                "frame_rate_hz": 30.0,
+                "endpoint_offset_frames": 15,
+            }
+        ),
+        encoding="utf-8",
+    )
     audited_ids = ["a", "b"]
+    audited_frame_rows = [
+        {"sample_id": "a", "take_uid": "ta", "frame_index": 30},
+        {"sample_id": "b", "take_uid": "tb", "frame_index": 60},
+    ]
+    audited_frame_rows_text = "".join(
+        f"{row['sample_id']}\t{row['take_uid']}\t{row['frame_index']}\n"
+        for row in audited_frame_rows
+    )
     report = tmp_path / "semantic_audit.json"
     report.write_text(
         json.dumps(
@@ -216,6 +241,20 @@ def test_freeze_npy_source_contract_binds_rgb_transition_and_arrays(tmp_path: Pa
                 ).hexdigest(),
                 "audited_samples": 2,
                 "exact_view_pair_matches": 4,
+                "frame_selection_mode": "frozen_frame_index_sidecar",
+                "frame_rate_hz": 30.0,
+                "endpoint_offset_frames": 15,
+                "maximum_t0_timestamp_distance_frames": 0.0,
+                "frame_index_npy": str((source / "frame_index.npy").resolve()),
+                "frame_index": sources["source"]["frame_index"],
+                "audited_frame_rows": audited_frame_rows,
+                "audited_frame_rows_sha256": hashlib.sha256(
+                    audited_frame_rows_text.encode("utf-8")
+                ).hexdigest(),
+                "materialization_report": str(materialization_report.resolve()),
+                "materialization_report_sha256": hashlib.sha256(
+                    materialization_report.read_bytes()
+                ).hexdigest(),
             }
         ),
         encoding="utf-8",
