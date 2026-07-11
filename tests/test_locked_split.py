@@ -133,6 +133,24 @@ def test_perceptual_nearest_neighbor_detects_exact_duplicates() -> None:
     assert not report["passed"]
     assert report["violations"][0]["candidate_index"] == 0
     assert report["violations"][0]["reference_index"] == 1
+    assert report["metric"] == "appearance_plus_temporal_difference_cosine_v2"
+
+
+def test_perceptual_nearest_neighbor_does_not_treat_static_exo_background_as_leakage() -> None:
+    rng = np.random.default_rng(8)
+    background = rng.integers(32, 224, size=(64, 64, 3), dtype=np.uint8)
+    candidates = np.repeat(background[None, None], repeats=2, axis=1)
+    references = np.repeat(background[None, None], repeats=2, axis=1)
+    candidates = candidates.copy()
+    references = references.copy()
+    candidates[0, 1, 8:24, 8:24] = np.clip(
+        candidates[0, 1, 8:24, 8:24].astype(np.int16) + 30, 0, 255
+    ).astype(np.uint8)
+    references[0, 1, 40:56, 40:56] = np.clip(
+        references[0, 1, 40:56, 40:56].astype(np.int16) + 30, 0, 255
+    ).astype(np.uint8)
+    report = perceptual_nearest_neighbor_audit(candidates, references, maximum_similarity=0.995)
+    assert report["passed"]
 
 
 def test_short73_cli_bootstraps_repo_imports() -> None:

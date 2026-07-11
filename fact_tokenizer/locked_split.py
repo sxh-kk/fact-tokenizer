@@ -325,7 +325,14 @@ def audit_locked_samples(
 
 
 def perceptual_vectors(videos: np.ndarray, size: int = 16, block_size: int = 64) -> np.ndarray:
-    """Build normalized low-resolution transition vectors for leakage screening."""
+    """Build motion-aware low-resolution transition vectors for leakage screening.
+
+    The appearance component catches copied frames while the independently
+    normalized temporal-difference component prevents a shared static Exo
+    background from dominating the score.  The joined vector is normalized a
+    final time so an exact duplicate always has cosine similarity one, even
+    when both transitions are completely static.
+    """
 
     array = np.asarray(videos)
     if array.ndim != 5 or array.shape[1] < 2:
@@ -338,17 +345,22 @@ def perceptual_vectors(videos: np.ndarray, size: int = 16, block_size: int = 64)
     width = array.shape[3] if channels_last else array.shape[4]
     y_index = np.linspace(0, height - 1, size).round().astype(int)
     x_index = np.linspace(0, width - 1, size).round().astype(int)
-    vectors = np.empty((len(array), 2 * size * size), dtype=np.float32)
+    vectors = np.empty((len(array), 3 * size * size), dtype=np.float32)
     for start in range(0, len(array), block_size):
-        block = np.asarray(array[start : start + block_size][:, [0, -1]])
+        block = np.asarray(array[start : start + block_size][:, [0, -1]], dtype=np.float32)
         if channels_last:
             gray = block[:, :, y_index[:, None], x_index[None, :], :].mean(axis=-1, dtype=np.float32)
         else:
             gray = block[:, :, :, y_index[:, None], x_index[None, :]].mean(axis=2, dtype=np.float32)
-        small = gray.reshape(len(block), -1)
-        small -= small.mean(axis=1, keepdims=True)
-        norms = np.sqrt(np.sum(small * small, axis=1, keepdims=True))
-        vectors[start : start + len(block)] = small / np.maximum(norms, 1e-8)
+        appearance = gray.reshape(len(block), -1)
+        appearance -= appearance.mean(axis=1, keepdims=True)
+        appearance /= np.maximum(np.linalg.norm(appearance, axis=1, keepdims=True), 1e-8)
+        motion = (gray[:, 1] - gray[:, 0]).reshape(len(block), -1)
+        motion -= motion.mean(axis=1, keepdims=True)
+        motion /= np.maximum(np.linalg.norm(motion, axis=1, keepdims=True), 1e-8)
+        joined = np.concatenate((appearance, motion), axis=1)
+        joined /= np.maximum(np.linalg.norm(joined, axis=1, keepdims=True), 1e-8)
+        vectors[start : start + len(block)] = joined
     return vectors
 
 
@@ -378,6 +390,7 @@ def perceptual_nearest_neighbor_audit(
         indices[improved] = start + local_indices[improved]
     violations = np.flatnonzero(maxima >= maximum_similarity)
     return {
+        "metric": "appearance_plus_temporal_difference_cosine_v2",
         "candidate_count": len(candidate),
         "reference_count": len(reference),
         "maximum_similarity_allowed": maximum_similarity,
