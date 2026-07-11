@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from freeze_fact_npy_source_contract import inspect_source, sha256_file  # noqa: E402
-from prepare_fact_egoexo_npz import read_frame_pair_from_capture, resolve_video  # noqa: E402
+from prepare_fact_egoexo_npz import resolve_video  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +42,25 @@ def as_text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return str(value)
+
+
+def read_frame_pair_by_index(
+    capture: cv2.VideoCapture, timestamp: float, transition_seconds: float, resize: int
+) -> np.ndarray | None:
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(fps) or abs(fps - 30.0) > 1e-3:
+        raise ValueError(f"semantic audit requires a 30Hz aligned video, got {fps}")
+    frames = []
+    for value in (timestamp, timestamp + transition_seconds):
+        frame_index = int(round(value * fps))
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            return None
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (resize, resize), interpolation=cv2.INTER_AREA)
+        frames.append(frame)
+    return np.stack(frames, axis=0)
 
 
 def main() -> None:
@@ -103,7 +122,7 @@ def main() -> None:
         try:
             for row in sorted(by_take[take_uid], key=lambda value: value["timestamp"]):
                 for view, capture in captures.items():
-                    decoded = read_frame_pair_from_capture(
+                    decoded = read_frame_pair_by_index(
                         capture,
                         float(row["timestamp"]),
                         0.5,
@@ -151,6 +170,7 @@ def main() -> None:
         "transition_seconds": 0.5,
         "endpoint_semantics": ["t", "t+0.5s"],
         "resize": args.resize,
+        "frame_selection": "round(timestamp_seconds * 30Hz), exact CAP_PROP_POS_FRAMES seek",
         "video_inventory": video_inventory,
         "video_map_jsonl": str(args.video_map_jsonl),
         "video_map_sha256": sha256_file(args.video_map_jsonl),
