@@ -380,6 +380,7 @@ def test_weak_calibration_is_bound_to_all_60_dev_samples(tmp_path: Path) -> None
         "effect_label",
         "contact_label",
         "ambiguous_reason",
+        "annotator_id",
     ]
     with gold_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -394,6 +395,7 @@ def test_weak_calibration_is_bound_to_all_60_dev_samples(tmp_path: Path) -> None
                     "effect_label": "state_change_or_manipulate",
                     "contact_label": "stable",
                     "ambiguous_reason": "",
+                    "annotator_id": "ann_a01",
                 }
             )
     report_path = tmp_path / "calibration.json"

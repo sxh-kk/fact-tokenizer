@@ -2,6 +2,12 @@
 
 [English](README.md)
 
+连续、VQ-off 的 FACT v7 effect 实现见
+[`docs/fact_effect_v7_implementation.md`](docs/fact_effect_v7_implementation.md)。
+gold300 人工标注请从
+[`标注者上手指南`](docs/fact_gold300_annotator_guide.zh-CN.md)开始；数据管理员另见
+[`交付与封存手册`](docs/fact_gold300_annotation_admin_runbook.zh-CN.md)。
+
 FACT tokenizer 第一阶段原型，用于从 ego/exo 配对视频 transition 中学习 ego-accessible shared action token。
 
 当前 MVP 支持：

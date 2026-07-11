@@ -32,6 +32,7 @@ from scripts.materialize_fact_gold300_review import (
     [
         "prepare_fact_gold300.py",
         "validate_fact_gold300.py",
+        "validate_fact_gold300_submission.py",
         "materialize_fact_gold300_review.py",
         "freeze_fact_npy_source_contract.py",
     ],
@@ -122,12 +123,48 @@ def test_materialize_gold_review_pack_joins_sources_and_renders_blind_images(tmp
     assert (admin_output / "sealed" / "blank_templates" / template_path.name).is_file()
     assert not (annotator_a_output / "sealed").exists()
     assert not (annotator_b_output / "sealed").exists()
+    for output in (annotator_a_output, annotator_b_output):
+        assert (output / "README_FIRST.zh-CN.md").is_file()
+        assert (output / "ANNOTATION_GUIDE.zh-CN.md").is_file()
+        assert (output / "task.template.csv").is_file()
+        assert (output / "validate_submission.py").is_file()
     assert len(list((annotator_a_output / "images").rglob("*.png"))) == 3
     assert len(list((annotator_b_output / "images").rglob("*.png"))) == 1
     with (annotator_a_output / "task.csv").open(newline="", encoding="utf-8") as handle:
-        assert len(list(csv.DictReader(handle))) == 3
+        reader = csv.DictReader(handle)
+        assert reader.fieldnames == [
+            "review_id",
+            "image",
+            "effect_label",
+            "contact_label",
+            "ambiguous_reason",
+            "annotator_id",
+            "notes",
+        ]
+        assert len(list(reader)) == 3
     with (annotator_b_output / "task.csv").open(newline="", encoding="utf-8") as handle:
         assert len(list(csv.DictReader(handle))) == 1
+    a_delivery = json.loads((annotator_a_output / "delivery_manifest.json").read_text(encoding="utf-8"))
+    b_delivery = json.loads((annotator_b_output / "delivery_manifest.json").read_text(encoding="utf-8"))
+    assert a_delivery["schema"] == "fact-gold300-annotator-delivery-v2"
+    assert a_delivery["tasks"] == 3
+    assert b_delivery["tasks"] == 1
+    assert a_delivery["task_template_sha256"] == hashlib.sha256(
+        (annotator_a_output / "task.template.csv").read_bytes()
+    ).hexdigest()
+    assert a_delivery["quickstart_sha256"] == hashlib.sha256(
+        (annotator_a_output / "README_FIRST.zh-CN.md").read_bytes()
+    ).hexdigest()
+    assert a_delivery["submission_validator_sha256"] == hashlib.sha256(
+        (annotator_a_output / "validate_submission.py").read_bytes()
+    ).hexdigest()
+    assert a_delivery["admin_binding"]["sealed_mapping_sha256"] == report["sealed_mapping_sha256"]
+    assert "完成本包全部任务" in (annotator_a_output / "README_FIRST.zh-CN.md").read_text(
+        encoding="utf-8"
+    )
+    assert "不得查看或讨论 A" in (annotator_b_output / "README_FIRST.zh-CN.md").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_gold_review_pack_rejects_unfrozen_nonblind_and_misaligned_inputs(tmp_path: Path) -> None:
@@ -337,8 +374,14 @@ def test_build_gold300_exact_counts_excludes_diagnostics_and_freezes(tmp_path: P
         assert {row["gold_split"] for row in rows} == {split}
         assert metadata["annotation_templates"][split]["rows"] == expected
     guide = (tmp_path / "ANNOTATION_GUIDE.zh-CN.md").read_text(encoding="utf-8")
-    assert "FACT effect/contact 标注指南" in guide
-    assert "只依据 Ego 与 Exo 图像" in guide
+    assert "FACT v7 effect/contact gold 标注者上手指南" in guide
+    assert "Ego t+0.5s" in guide
+    assert "approach_align" in guide
+    assert "state_change_or_manipulate" in guide
+    assert "contact_label" in guide
+    assert "task.template.csv" in guide
+    assert "no_effect`、`ambiguous` 和 `unknown`" in guide
+    assert "\ufffd" not in guide
 
 
 def test_gold_validation_and_kappa_gate() -> None:
@@ -348,6 +391,7 @@ def test_gold_validation_and_kappa_gate() -> None:
         "effect_label": "acquire_control",
         "contact_label": "onset",
         "ambiguous_reason": "",
+        "annotator_id": "ann_a01",
     }
     assert validate_gold_rows([valid]) == []
     invalid = {**valid, "representation_training_valid": "true", "effect_label": "invented"}
