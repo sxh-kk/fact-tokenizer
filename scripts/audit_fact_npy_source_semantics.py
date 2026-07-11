@@ -151,6 +151,7 @@ def main() -> None:
         materialization_report = json.loads(
             materialization_report_path.read_text(encoding="utf-8")
         )
+        reported_frame_identity = materialization_report.get("frame_index", {})
         if (
             materialization_report.get("schema")
             not in {
@@ -160,7 +161,10 @@ def main() -> None:
             }
             or
             materialization_report.get("files") != files
-            or materialization_report.get("frame_index") != frame_index_identity
+            or any(
+                reported_frame_identity.get(key) != value
+                for key, value in frame_index_identity.items()
+            )
             or materialization_report.get("color_space") != "RGB"
             or float(materialization_report.get("transition_seconds", -1.0))
             != args.transition_seconds

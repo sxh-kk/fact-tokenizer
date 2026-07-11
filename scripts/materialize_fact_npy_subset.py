@@ -63,12 +63,17 @@ def main() -> None:
     parent_frame_index = np.load(
         args.parent_dir / "frame_index.npy", mmap_mode="r", allow_pickle=False
     )
+    parent_frame_identity = identity(args.parent_dir, "frame_index")
+    reported_frame_identity = parent_report.get("frame_index", {})
     if (
         parent_frame_index.ndim != 1
         or len(parent_frame_index) != len(parent["sample_id"])
         or not np.issubdtype(parent_frame_index.dtype, np.integer)
         or (parent_frame_index < 0).any()
-        or parent_report.get("frame_index") != identity(args.parent_dir, "frame_index")
+        or any(
+            reported_frame_identity.get(key) != value
+            for key, value in parent_frame_identity.items()
+        )
     ):
         raise ValueError("parent frame_index.npy is missing, invalid, or no longer hash-bound")
     indices = np.load(args.row_index_npy, mmap_mode="r", allow_pickle=False)
