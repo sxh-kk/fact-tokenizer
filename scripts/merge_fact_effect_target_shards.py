@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from fact_tokenizer.effect_targets import verify_target_cache
 from fact_tokenizer.effect_manifest import read_manifest_jsonl
+from fact_tokenizer.target_audit import validate_visual_audit_gate
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,24 +76,40 @@ def main() -> None:
     if len(identity_pairs) != 1:
         raise ValueError("target shards have different config or source/weight identities")
     expected_records = read_manifest_jsonl(args.expected_manifest)
-    expected_ids = {record.sample_id for record in expected_records}
+    expected_by_id = {record.sample_id: record for record in expected_records}
+    expected_ids = set(expected_by_id)
     actual_ids = set(all_records)
     if actual_ids != expected_ids:
         raise ValueError(
             "target shards do not exactly cover the expected manifest: "
             f"missing={sorted(expected_ids - actual_ids)[:3]}, extra={sorted(actual_ids - expected_ids)[:3]}"
         )
-    gate = json.loads(args.visual_audit_gate.read_text(encoding="utf-8"))
     identity_sha256 = configs[0].get("identity_sha256")
-    if (
-        gate.get("passed") is not True
-        or int(gate.get("rows", 0)) != 50
-        or int(gate.get("fully_aligned", 0)) < 45
-        or float(gate.get("minimum_pass_fraction", 0.0)) < 0.90
-        or float(gate.get("pass_fraction", 0.0)) < 0.90
-        or gate.get("target_identity_sha256") != identity_sha256
-    ):
-        raise ValueError("visual audit gate does not release these target shards")
+    expected_manifest_sha256 = sha256_file(args.expected_manifest)
+    for config in configs:
+        identity = config.get("identity")
+        source_hashes = identity.get("source_hashes") if isinstance(identity, dict) else None
+        if not isinstance(source_hashes, dict) or source_hashes.get("manifest") != expected_manifest_sha256:
+            raise ValueError("expected manifest hash differs from the target source identity")
+    for sample_id, (_, target_record) in all_records.items():
+        expected = expected_by_id[sample_id]
+        metadata = target_record.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError(f"target record lacks metadata for {sample_id}")
+        expected_metadata = {
+            "sample_key": expected.sample_key,
+            "take_uid": expected.take_uid,
+            "split": expected.split,
+            "row_index": expected.row_index,
+            "timestamp": expected.timestamp,
+        }
+        actual_metadata = {key: metadata.get(key) for key in expected_metadata}
+        if actual_metadata != expected_metadata:
+            raise ValueError(
+                f"target record metadata differs from frozen manifest for {sample_id}: "
+                f"expected={expected_metadata}, actual={actual_metadata}"
+            )
+    gate = validate_visual_audit_gate(args.visual_audit_gate, identity_sha256)
     staging = args.output_dir.with_name(f".{args.output_dir.name}.staging-{uuid.uuid4().hex[:12]}")
     (staging / "samples").mkdir(parents=True)
     try:
@@ -113,11 +130,15 @@ def main() -> None:
         config = dict(configs[0])
         config["samples"] = len(merged_records)
         config["formal_release"] = {
-            "visual_audit_gate_sha256": sha256_file(args.visual_audit_gate),
+            "visual_audit_gate": gate["_gate_path"],
+            "visual_audit_gate_sha256": gate["_gate_sha256"],
+            "visual_audit_gate_schema": gate["schema"],
             "review_rows": 50,
             "pass_fraction": float(gate["pass_fraction"]),
             "target_identity_sha256": identity_sha256,
-            "expected_manifest_sha256": sha256_file(args.expected_manifest),
+            "expected_manifest_sha256": expected_manifest_sha256,
+            "review_csv_sha256": gate["review_csv_sha256"],
+            "audit_pack_sha256": gate["audit_pack_sha256"],
         }
         (staging / "target_config.json").write_text(
             json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -129,8 +150,9 @@ def main() -> None:
             "shards": shard_reports,
             "config_sha256": config["config_sha256"],
             "identity_sha256": config["identity_sha256"],
-            "expected_manifest_sha256": sha256_file(args.expected_manifest),
-            "visual_audit_gate_sha256": sha256_file(args.visual_audit_gate),
+            "expected_manifest_sha256": expected_manifest_sha256,
+            "visual_audit_gate": gate["_gate_path"],
+            "visual_audit_gate_sha256": gate["_gate_sha256"],
             "target_manifest_sha256": sha256_file(staging / "target_manifest.jsonl"),
         }
         (staging / "merge_report.json").write_text(

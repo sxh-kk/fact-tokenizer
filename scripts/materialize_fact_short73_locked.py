@@ -27,6 +27,7 @@ from fact_tokenizer.effect_manifest import (  # noqa: E402
     EffectSampleRecord,
     write_manifest_jsonl,
 )
+from fact_tokenizer.locked_split import validate_final_freeze_candidate_contract  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +108,7 @@ def main() -> None:
     takes = {row["take_uid"]: row for row in load_jsonl(selected_path)}
     if len(samples) != 584 or len(takes) != 73:
         raise ValueError("short73 materialization requires exactly 73 takes and 584 samples")
+    audited_candidate_sha256 = validate_final_freeze_candidate_contract(freeze, len(samples))
     transition_seconds = float(freeze.get("config", {}).get("transition_seconds", -1.0))
     if transition_seconds != 0.5 or any(
         abs((float(row["end_timestamp"]) - float(row["timestamp"])) - transition_seconds) > 1e-6
@@ -204,6 +206,28 @@ def main() -> None:
         for index, row in enumerate(samples)
     ]
     write_manifest_jsonl(staging / "effect_manifest_locked.jsonl", locked_manifest)
+    locked_isolation = {
+        "source_freeze": str((args.locked_dir / "freeze.json").resolve()),
+        "source_freeze_sha256": sha256_file(args.locked_dir / "freeze.json"),
+        "samples": str(sample_path.resolve()),
+        "samples_sha256": sha256_file(sample_path),
+        "selected_takes": str(selected_path.resolve()),
+        "selected_takes_sha256": sha256_file(selected_path),
+        "role": array_identity(staging, "role"),
+        "training_valid": array_identity(staging, "training_valid"),
+        "effect_manifest": str((args.output_dir / "effect_manifest_locked.jsonl").resolve()),
+        "effect_manifest_sha256": sha256_file(staging / "effect_manifest_locked.jsonl"),
+        "pnn_candidate_sha256": audited_candidate_sha256,
+    }
+    if freeze_stage == "final":
+        actual_candidate_sha256 = {
+            name: sha256_file(staging / f"{name}.npy")
+            for name in ("ego", "exo", "sample_id")
+        }
+        if actual_candidate_sha256 != audited_candidate_sha256:
+            raise ValueError(
+                "final short73 materialization differs from the exact arrays accepted by the PNN audit"
+            )
     report = {
         "schema": "fact-short73-materialization-v3",
         "locked_set_id": freeze["locked_set_id"],
@@ -255,6 +279,7 @@ def main() -> None:
         "freeze_stage": freeze_stage,
         "evaluation_allowed": freeze_stage == "final",
         "effect_manifest_sha256": sha256_file(staging / "effect_manifest_locked.jsonl"),
+        "locked_isolation": locked_isolation,
         "video_inventory": video_inventory,
         "materializer_code_sha256": sha256_file(Path(__file__)),
         "opencv_version": cv2.__version__,

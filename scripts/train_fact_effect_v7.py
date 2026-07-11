@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import random
+import subprocess
 import sys
 from typing import Any, Mapping
 
@@ -40,6 +41,7 @@ from fact_tokenizer.effect_experiments import (  # noqa: E402
 from fact_tokenizer.effect_losses import FACTV7ObjectiveConfig, compute_fact_v7_objective  # noqa: E402
 from fact_tokenizer.model import DINOv2PatchFeatureExtractor, MockPatchFeatureExtractor  # noqa: E402
 from fact_tokenizer.paired_eligibility import load_paired_control_eligibility  # noqa: E402
+from fact_tokenizer.target_audit import validate_visual_audit_gate  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,6 +120,39 @@ def module_state_sha256(module: torch.nn.Module) -> str:
     return digest.hexdigest()
 
 
+def tree_python_sha256(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*.py")):
+        if any(part in {".git", "__pycache__"} for part in path.parts):
+            continue
+        digest.update(path.relative_to(directory).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def validate_dino_repository(provenance: Mapping[str, Any]) -> None:
+    repository = Path(str(provenance.get("resolved_repo", "")))
+    if provenance.get("exists") is not True or not repository.is_dir():
+        raise ValueError("formal target cache does not bind an available DINO implementation")
+    if provenance.get("python_code_sha256") != tree_python_sha256(repository):
+        raise ValueError("formal target DINO repository code has changed")
+    for field, ref in (("git_head", "HEAD"), ("git_tree", "HEAD^{tree}")):
+        expected = provenance.get(field)
+        if expected is None:
+            continue
+        actual = subprocess.run(
+            ["git", "rev-parse", ref],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if actual != expected:
+            raise ValueError(f"formal target DINO repository {field} has changed")
+
+
 def validate_formal_target_cache(
     cache: EffectTargetCache,
     *,
@@ -138,31 +173,100 @@ def validate_formal_target_cache(
         or dino.get("model") != dino_model
         or dino.get("formal_target") is not True
         or len(str(dino.get("state_sha256", ""))) != 64
+        or not isinstance(dino.get("repository"), dict)
     ):
         raise ValueError("formal target cache DINO identity differs from the training backbone contract")
+    validate_dino_repository(dino["repository"])
+    runtime = identity.get("runtime")
+    if (
+        not isinstance(runtime, dict)
+        or runtime.get("deterministic_algorithms") is not True
+        or runtime.get("cudnn_deterministic") is not True
+        or runtime.get("cudnn_benchmark") is not False
+        or runtime.get("cudnn_allow_tf32") is not False
+        or runtime.get("cuda_matmul_allow_tf32") is not False
+    ):
+        raise ValueError("formal target cache lacks deterministic target-build provenance")
     sources = identity.get("source_hashes", {})
     expected_hashes = {
         "manifest": sha256_file(manifest),
         "builder_code": sha256_file(ROOT / "scripts" / "build_fact_effect_targets.py"),
         "effect_targets_code": sha256_file(ROOT / "fact_tokenizer" / "effect_targets.py"),
+        "model_code": sha256_file(ROOT / "fact_tokenizer" / "model.py"),
     }
     for name, expected in expected_hashes.items():
         if sources.get(name) != expected:
             raise ValueError(f"formal target cache {name} hash differs from current training assets/code")
     view_hashes = sources.get("views", {})
+    actual_file_hashes: dict[str, str] = {}
     for view in view_names:
         path = input_dir / f"{view}.npy"
-        if view_hashes.get(view) != sha256_file(path):
+        actual_file_hashes[view] = sha256_file(path)
+        if view_hashes.get(view) != actual_file_hashes[view]:
             raise ValueError(f"formal target cache view {view!r} hash differs from training input")
+    transition_contract = identity.get("input_transition_contract", {})
+    report_path = input_dir / "materialization_report.json"
+    frame_index_path = input_dir / "frame_index.npy"
+    source_contract_path = Path(str(transition_contract.get("source_contract", "")))
+    if (
+        Path(transition_contract.get("materialization_report", "")).resolve()
+        != report_path.resolve()
+        or not report_path.is_file()
+        or transition_contract.get("materialization_report_sha256") != sha256_file(report_path)
+        or not frame_index_path.is_file()
+        or transition_contract.get("source_contract_schema") != "fact-npy-source-contract-v1"
+        or not source_contract_path.is_file()
+        or transition_contract.get("source_contract_sha256") != sha256_file(source_contract_path)
+    ):
+        raise ValueError("formal target cache does not bind the active transition materialization")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if (
+        report.get("color_space") != "RGB"
+        or float(report.get("transition_seconds", -1.0)) != 0.5
+        or report.get("endpoint_semantics") != ["t", "t+0.5s"]
+        or float(report.get("frame_rate_hz", -1.0)) != 30.0
+        or int(report.get("endpoint_offset_frames", -1)) != 15
+    ):
+        raise ValueError("formal target cache transition materialization is not RGB t-to-t+0.5s")
+    contract_files = transition_contract.get("files", {})
+    for name in (*view_names, "sample_id", "take_uid", "timestamp"):
+        path = input_dir / f"{name}.npy"
+        digest = actual_file_hashes.get(name) or sha256_file(path)
+        if contract_files.get(name, {}).get("sha256") != digest:
+            raise ValueError(f"formal target transition contract differs for {name}.npy")
+    frame_contract = transition_contract.get("frame_index", {})
+    frame_indices = np.load(frame_index_path, mmap_mode="r", allow_pickle=False)
+    if (
+        frame_contract.get("sha256") != sha256_file(frame_index_path)
+        or frame_contract.get("shape") != list(frame_indices.shape)
+        or frame_contract.get("dtype") != str(frame_indices.dtype)
+        or frame_indices.ndim != 1
+        or not np.issubdtype(frame_indices.dtype, np.integer)
+        or (frame_indices < 0).any()
+    ):
+        raise ValueError("formal target cache frame_index contract differs from training input")
     release = config.get("formal_release")
     if (
         not isinstance(release, dict)
+        or release.get("visual_audit_gate_schema") != "fact-target-visual-audit-gate-v2"
         or int(release.get("review_rows", 0)) != 50
         or float(release.get("pass_fraction", 0.0)) < 0.90
         or release.get("target_identity_sha256") != config.get("identity_sha256")
-        or len(str(release.get("visual_audit_gate_sha256", ""))) != 64
+        or len(str(release.get("review_csv_sha256", ""))) != 64
+        or len(str(release.get("audit_pack_sha256", ""))) != 64
     ):
         raise ValueError("formal target cache has not been released by the 50-sample visual audit gate")
+    gate_path = Path(str(release.get("visual_audit_gate", "")))
+    gate = validate_visual_audit_gate(gate_path, str(config["identity_sha256"]))
+    if (
+        release.get("visual_audit_gate_sha256") != gate["_gate_sha256"]
+        or str(gate_path.resolve()) != gate["_gate_path"]
+        or int(gate.get("rows", 0)) != int(release["review_rows"])
+        or float(gate.get("pass_fraction", 0.0)) != float(release["pass_fraction"])
+        or gate.get("review_csv_sha256") != release["review_csv_sha256"]
+        or gate.get("audit_pack_sha256") != release["audit_pack_sha256"]
+    ):
+        raise ValueError("formal target cache release differs from its live visual-audit evidence")
     return str(dino["state_sha256"])
 
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any, Mapping, Sequence
 
@@ -39,6 +41,10 @@ from fact_tokenizer.effect_targets import (  # noqa: E402
     WEAK_VERB_MAP_VERSION,
 )
 from fact_tokenizer.model import DINOv2PatchFeatureExtractor, MockPatchFeatureExtractor  # noqa: E402
+from fact_tokenizer.target_audit_selection import (  # noqa: E402
+    validate_audit_selection_contract,
+)
+from fact_tokenizer.target_audit import validate_visual_audit_gate  # noqa: E402
 
 
 def named_path(value: str) -> tuple[str, Path]:
@@ -53,6 +59,11 @@ def named_path(value: str) -> tuple[str, Path]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, required=True)
+    parser.add_argument(
+        "--source-contract",
+        type=Path,
+        help="Hash-bound fact-npy-source-contract-v1; mandatory outside smoke mode.",
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--views", nargs="+", default=["ego", "exo"])
@@ -148,17 +159,49 @@ def npy_identity(path: Path) -> dict:
     }
 
 
-def validate_formal_input_contract(
-    input_dir: Path,
-    records: Sequence,
-    transition_seconds: float,
-) -> dict:
-    if transition_seconds != 0.5:
-        raise ValueError("formal v7 targets require exactly 0.5-second transitions")
-    report_path = input_dir / "materialization_report.json"
-    frame_index_path = input_dir / "frame_index.npy"
-    if not report_path.is_file() or not frame_index_path.is_file():
-        raise ValueError("formal target input requires materialization_report.json and frame_index.npy")
+CORE_SOURCE_ARRAYS = ("ego", "exo", "sample_id", "take_uid", "timestamp")
+
+
+def _sample_id_digest(values: Sequence[str]) -> str:
+    return hashlib.sha256(
+        "".join(value + "\n" for value in sorted(values)).encode("utf-8")
+    ).hexdigest()
+
+
+def _source_snapshot(directory: Path) -> tuple[dict[str, np.ndarray], dict, np.ndarray, dict]:
+    arrays = {
+        name: np.load(directory / f"{name}.npy", mmap_mode="r", allow_pickle=False)
+        for name in CORE_SOURCE_ARRAYS
+    }
+    if len({len(array) for array in arrays.values()}) != 1:
+        raise ValueError("source contract arrays are not row aligned")
+    for view in ("ego", "exo"):
+        value = arrays[view]
+        if value.ndim != 5 or value.shape[1] != 2 or value.dtype != np.uint8:
+            raise ValueError(f"source contract {view}.npy is not uint8 paired RGB")
+    files = {
+        name: npy_identity(directory / f"{name}.npy") for name in CORE_SOURCE_ARRAYS
+    }
+    frame_path = directory / "frame_index.npy"
+    frame = np.load(frame_path, mmap_mode="r", allow_pickle=False)
+    if (
+        frame.ndim != 1
+        or len(frame) != len(arrays["sample_id"])
+        or not np.issubdtype(frame.dtype, np.integer)
+        or (frame < 0).any()
+    ):
+        raise ValueError("source contract frame_index.npy is invalid")
+    return arrays, files, frame, npy_identity(frame_path)
+
+
+def _validate_materialization_report(
+    directory: Path,
+    files: Mapping[str, Any],
+    frame_identity: Mapping[str, Any],
+) -> tuple[Path, dict]:
+    report_path = directory / "materialization_report.json"
+    if not report_path.is_file():
+        raise ValueError("formal target input requires materialization_report.json")
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if (
         report.get("schema")
@@ -172,27 +215,337 @@ def validate_formal_input_contract(
         or report.get("endpoint_semantics") != ["t", "t+0.5s"]
         or float(report.get("frame_rate_hz", -1.0)) != 30.0
         or int(report.get("endpoint_offset_frames", -1)) != 15
+        or report.get("files") != files
+        or report.get("frame_index") != frame_identity
     ):
         raise ValueError("formal target input has an invalid transition materialization report")
-    names = ("ego", "exo", "sample_id", "take_uid", "timestamp")
-    files = {name: npy_identity(input_dir / f"{name}.npy") for name in names}
-    if report.get("files") != files:
-        raise ValueError("formal target input arrays no longer match the materialization report")
-    frame_identity = npy_identity(frame_index_path)
-    reported_frame = report.get("frame_index", {})
-    if any(reported_frame.get(key) != value for key, value in frame_identity.items()):
-        raise ValueError("formal target frame index no longer matches the materialization report")
-    frame_indices = np.load(frame_index_path, mmap_mode="r", allow_pickle=False)
+    return report_path, report
+
+
+def _validate_raw_semantic_evidence(
+    evidence: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    directory: Path,
+    arrays: Mapping[str, np.ndarray],
+    files: Mapping[str, Any],
+    frame_indices: np.ndarray,
+    frame_identity: Mapping[str, Any],
+) -> None:
+    report_path = Path(str(evidence.get("producer_report", "")))
     if (
-        frame_indices.ndim != 1
-        or len(frame_indices) != len(records)
-        or not np.issubdtype(frame_indices.dtype, np.integer)
-        or (frame_indices < 0).any()
+        not report_path.is_file()
+        or sha256_file(report_path) != evidence.get("producer_report_sha256")
     ):
-        raise ValueError("formal target frame_index.npy is invalid")
-    sample_ids = np.load(input_dir / "sample_id.npy", mmap_mode="r", allow_pickle=False)
-    take_uids = np.load(input_dir / "take_uid.npy", mmap_mode="r", allow_pickle=False)
-    timestamps = np.load(input_dir / "timestamp.npy", mmap_mode="r", allow_pickle=False)
+        raise ValueError("source contract producer report hash mismatch")
+    producer_code = evidence.get("producer_code_sha256", {})
+    if not isinstance(producer_code, Mapping) or not producer_code:
+        raise ValueError("source contract producer code evidence is missing")
+    for code_path_text, expected_hash in producer_code.items():
+        code_path = Path(code_path_text)
+        if not code_path.is_absolute():
+            code_path = ROOT / code_path
+        if not code_path.is_file() or sha256_file(code_path) != expected_hash:
+            raise ValueError("source contract producer code hash mismatch")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    audited_ids = [str(value) for value in contract.get("audited_sample_ids", [])]
+    materialization_path = directory / "materialization_report.json"
+    audit_code_path = ROOT / "scripts" / "audit_fact_npy_source_semantics.py"
+    decoder_code_path = ROOT / "scripts" / "prepare_fact_egoexo_npz.py"
+    video_map_path = Path(str(report.get("video_map_jsonl", "")))
+    gold_manifest_path = Path(str(report.get("gold_manifest", "")))
+    if (
+        report.get("schema") != "fact-npy-source-semantic-audit-v1"
+        or report.get("passed") is not True
+        or Path(str(report.get("source_dir", ""))).resolve() != directory.resolve()
+        or int(report.get("rows", -1)) != len(arrays["sample_id"])
+        or report.get("files") != files
+        or report.get("color_space") != "RGB"
+        or float(report.get("transition_seconds", -1.0)) != 0.5
+        or report.get("endpoint_semantics") != ["t", "t+0.5s"]
+        or int(report.get("resize", -1)) != 224
+        or report.get("frame_selection_mode") != "frozen_frame_index_sidecar"
+        or float(report.get("frame_rate_hz", -1.0)) != 30.0
+        or int(report.get("endpoint_offset_frames", -1)) != 15
+        or float(report.get("maximum_t0_timestamp_distance_frames", 999.0)) > 0.501
+        or Path(str(report.get("frame_index_npy", ""))).resolve()
+        != (directory / "frame_index.npy").resolve()
+        or report.get("frame_index") != frame_identity
+        or Path(str(report.get("materialization_report", ""))).resolve()
+        != materialization_path.resolve()
+        or report.get("materialization_report_sha256") != sha256_file(materialization_path)
+        or sorted(str(value) for value in report.get("audited_sample_ids", []))
+        != sorted(audited_ids)
+        or report.get("audited_sample_ids_sha256") != _sample_id_digest(audited_ids)
+        or int(report.get("audited_samples", -1)) != len(audited_ids)
+        or int(report.get("exact_view_pair_matches", -1)) != 2 * len(audited_ids)
+        or report.get("audit_code_sha256") != sha256_file(audit_code_path)
+        or report.get("audit_code_sha256") not in set(producer_code.values())
+        or report.get("decoder_code_sha256") != sha256_file(decoder_code_path)
+        or not video_map_path.is_file()
+        or report.get("video_map_sha256") != sha256_file(video_map_path)
+        or not gold_manifest_path.is_file()
+        or report.get("gold_manifest_sha256") != sha256_file(gold_manifest_path)
+        or not isinstance(report.get("included_splits"), list)
+        or not report.get("included_splits")
+    ):
+        raise ValueError("source contract raw-video semantic evidence is invalid")
+    frame_rows = report.get("audited_frame_rows", [])
+    rows_text = "".join(
+        f"{row.get('sample_id')}\t{row.get('take_uid')}\t{row.get('frame_index')}\n"
+        for row in frame_rows
+    )
+    if (
+        len(frame_rows) != len(audited_ids)
+        or [str(row.get("sample_id")) for row in frame_rows] != sorted(audited_ids)
+        or report.get("audited_frame_rows_sha256")
+        != hashlib.sha256(rows_text.encode("utf-8")).hexdigest()
+    ):
+        raise ValueError("source contract raw-video frame mapping digest is invalid")
+    lookup = {as_text(value): index for index, value in enumerate(arrays["sample_id"])}
+    for row in frame_rows:
+        index = lookup.get(str(row.get("sample_id")))
+        if (
+            index is None
+            or str(row.get("take_uid")) != as_text(arrays["take_uid"][index])
+            or int(row.get("frame_index", -1)) != int(frame_indices[index])
+        ):
+            raise ValueError("source contract raw-video frame mapping differs from the source")
+    audited_takes = {str(row.get("take_uid")) for row in frame_rows}
+    inventory = report.get("video_inventory", [])
+    inventory_takes: set[str] = set()
+    if not isinstance(inventory, list):
+        raise ValueError("source contract raw-video inventory is missing")
+    for item in inventory:
+        if not isinstance(item, Mapping):
+            raise ValueError("source contract raw-video inventory entry is invalid")
+        take_uid = str(item.get("take_uid", ""))
+        if not take_uid or take_uid in inventory_takes:
+            raise ValueError("source contract raw-video inventory has a duplicate/missing take")
+        inventory_takes.add(take_uid)
+        for view in ("ego", "exo"):
+            video_path = Path(str(item.get(f"{view}_path", "")))
+            digest = str(item.get(f"{view}_sha256", ""))
+            if not video_path.is_file() or len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("source contract raw-video inventory path/hash is invalid")
+    if inventory_takes != audited_takes:
+        raise ValueError("source contract raw-video inventory does not cover the audited takes")
+
+
+def _validate_source_contract_recursive(
+    contract_path: Path,
+    expected_dir: Path,
+    *,
+    seen: set[Path] | None = None,
+) -> tuple[dict, dict[str, np.ndarray], dict, np.ndarray, dict]:
+    resolved_contract = contract_path.resolve()
+    seen = set() if seen is None else seen
+    if resolved_contract in seen:
+        raise ValueError("source contract parent cycle detected")
+    seen.add(resolved_contract)
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    directory = expected_dir.resolve()
+    arrays, files, frame_indices, frame_identity = _source_snapshot(directory)
+    _validate_materialization_report(directory, files, frame_identity)
+    audited_ids = [str(value) for value in contract.get("audited_sample_ids", [])]
+    if (
+        contract.get("schema") != "fact-npy-source-contract-v1"
+        or Path(str(contract.get("source_dir", ""))).resolve() != directory
+        or int(contract.get("rows", -1)) != len(arrays["sample_id"])
+        or contract.get("color_space") != "RGB"
+        or float(contract.get("transition_seconds", -1.0)) != 0.5
+        or contract.get("endpoint_semantics") != ["t", "t+0.5s"]
+        or contract.get("files") != files
+        or contract.get("frame_index") != frame_identity
+        or not audited_ids
+        or len(audited_ids) != len(set(audited_ids))
+        or contract.get("audited_sample_ids_sha256") != _sample_id_digest(audited_ids)
+    ):
+        raise ValueError("fact-npy-source-contract-v1 does not bind the current source")
+    source_ids = {as_text(value) for value in arrays["sample_id"]}
+    if not set(audited_ids).issubset(source_ids):
+        raise ValueError("source contract audited IDs are not a subset of the source")
+    evidence = contract.get("producer_evidence", {})
+    mode = evidence.get("mode")
+    if mode == "semantic_audit_against_raw_videos":
+        _validate_raw_semantic_evidence(
+            evidence, contract, directory, arrays, files, frame_indices, frame_identity
+        )
+    elif mode == "exact_parent_row_subset":
+        parent_path = Path(str(evidence.get("parent_contract", "")))
+        row_index_path = Path(str(evidence.get("source_row_index", "")))
+        if (
+            not parent_path.is_file()
+            or sha256_file(parent_path) != evidence.get("parent_contract_sha256")
+            or not row_index_path.is_file()
+            or sha256_file(row_index_path) != evidence.get("source_row_index_sha256")
+        ):
+            raise ValueError("source subset parent/index evidence hash mismatch")
+        parent_payload = json.loads(parent_path.read_text(encoding="utf-8"))
+        parent_dir = Path(str(parent_payload.get("source_dir", "")))
+        parent, parent_arrays, _, parent_frames, _ = _validate_source_contract_recursive(
+            parent_path, parent_dir, seen=seen
+        )
+        indices_raw = np.load(row_index_path, mmap_mode="r", allow_pickle=False)
+        if indices_raw.ndim != 1 or not np.issubdtype(indices_raw.dtype, np.integer):
+            raise ValueError("source subset row index must retain an integer dtype")
+        indices = np.asarray(indices_raw, dtype=np.int64)
+        if (
+            len(indices) != len(arrays["sample_id"])
+            or len(np.unique(indices)) != len(indices)
+            or (indices < 0).any()
+            or (indices >= len(parent_arrays["sample_id"])).any()
+        ):
+            raise ValueError("source subset row index is not a valid one-to-one mapping")
+        for name in CORE_SOURCE_ARRAYS:
+            for start in range(0, len(indices), 64):
+                selection = indices[start : start + 64]
+                if not np.array_equal(
+                    np.asarray(arrays[name][start : start + len(selection)]),
+                    np.asarray(parent_arrays[name][selection]),
+                ):
+                    raise ValueError(f"source subset {name}.npy differs from its parent rows")
+        if not np.array_equal(frame_indices, parent_frames[indices]):
+            raise ValueError("source subset frame_index.npy differs from its parent rows")
+        expected_audited = sorted(set(parent.get("audited_sample_ids", [])) & source_ids)
+        if sorted(audited_ids) != expected_audited:
+            raise ValueError("source subset audited IDs do not equal the inherited audited rows")
+        if evidence.get("inherited_producer_evidence") != parent.get("producer_evidence"):
+            raise ValueError("source subset inherited producer evidence was edited")
+        report = json.loads((directory / "materialization_report.json").read_text(encoding="utf-8"))
+        if report.get("schema") == "fact-npy-transition-subset-v1" and (
+            Path(str(report.get("parent_dir", ""))).resolve() != parent_dir.resolve()
+            or report.get("parent_report_sha256")
+            != sha256_file(parent_dir / "materialization_report.json")
+            or Path(str(report.get("row_index_npy", ""))).resolve() != row_index_path.resolve()
+            or report.get("row_index_sha256") != sha256_file(row_index_path)
+            or report.get("row_index_dtype", str(indices_raw.dtype)) != str(indices_raw.dtype)
+        ):
+            raise ValueError("subset materialization report does not bind its parent/index")
+    else:
+        raise ValueError("source contract has no supported producer evidence")
+    seen.remove(resolved_contract)
+    return contract, arrays, files, frame_indices, frame_identity
+
+
+def _validate_short73_isolation(
+    input_dir: Path,
+    records: Sequence,
+    report: Mapping[str, Any],
+    files: Mapping[str, Any],
+) -> None:
+    if (
+        report.get("freeze_stage") != "final"
+        or report.get("evaluation_allowed") is not True
+        or report.get("final_inference_only") is not True
+        or int(report.get("samples", -1)) != 584
+        or int(report.get("takes", -1)) != 73
+    ):
+        raise ValueError("short73 formal input is not a final inference-only freeze")
+    isolation = report.get("locked_isolation", {})
+    freeze_path = Path(str(isolation.get("source_freeze", "")))
+    sample_path = Path(str(isolation.get("samples", "")))
+    selected_path = Path(str(isolation.get("selected_takes", "")))
+    manifest_path = Path(str(isolation.get("effect_manifest", "")))
+    for path, key in (
+        (freeze_path, "source_freeze_sha256"),
+        (sample_path, "samples_sha256"),
+        (selected_path, "selected_takes_sha256"),
+        (manifest_path, "effect_manifest_sha256"),
+    ):
+        if not path.is_file() or sha256_file(path) != isolation.get(key):
+            raise ValueError(f"short73 locked isolation hash mismatch: {key}")
+    if isolation.get("source_freeze_sha256") != report.get("source_freeze_sha256"):
+        raise ValueError("short73 source freeze binding differs across the report")
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    if (
+        freeze.get("freeze_stage") != "final"
+        or freeze.get("evaluation_allowed") is not True
+        or freeze.get("final_inference_only") is not True
+        or freeze.get("training_valid") is not False
+        or freeze.get("model_selection_valid") is not False
+        or freeze.get("audit", {}).get("passed") is not True
+        or freeze.get("samples_sha256") != isolation.get("samples_sha256")
+        or freeze.get("selected_takes_sha256") != isolation.get("selected_takes_sha256")
+    ):
+        raise ValueError("short73 source freeze no longer proves locked isolation")
+    role = np.load(input_dir / "role.npy", mmap_mode="r", allow_pickle=False)
+    training_valid = np.load(input_dir / "training_valid.npy", mmap_mode="r", allow_pickle=False)
+    if (
+        isolation.get("role") != npy_identity(input_dir / "role.npy")
+        or isolation.get("training_valid") != npy_identity(input_dir / "training_valid.npy")
+        or len(role) != len(records)
+        or len(training_valid) != len(records)
+        or any(as_text(value) != "locked_test" for value in role)
+        or training_valid.dtype != np.bool_
+        or bool(np.asarray(training_valid).any())
+    ):
+        raise ValueError("short73 role/training_valid sidecars violate locked isolation")
+    if report.get("effect_manifest_sha256") != isolation.get("effect_manifest_sha256"):
+        raise ValueError("short73 effect manifest is not consistently hash-bound")
+    frozen_records = read_manifest_jsonl(manifest_path)
+    if list(records) != frozen_records:
+        raise ValueError("short73 supplied manifest differs from the freeze-bound effect manifest")
+    for index, record in enumerate(records):
+        if (
+            record.row_index != index
+            or record.split != "locked_test"
+            or record.training_valid is not False
+            or record.sample_id != as_text(np.load(input_dir / "sample_id.npy", mmap_mode="r", allow_pickle=False)[index])
+        ):
+            raise ValueError("short73 effect manifest contains a trainable or misaligned row")
+    pnn = freeze.get("audit", {}).get("perceptual_nearest_neighbor", {})
+    reports = pnn.get("reports", [])
+    candidates: dict[str, str] = {}
+    if pnn.get("status") != "complete" or not reports:
+        raise ValueError("short73 final freeze lacks completed PNN evidence")
+    for item in reports:
+        view = str(item.get("view", ""))
+        digest = str(item.get("candidate_sha256", ""))
+        if (
+            view not in {"ego", "exo"}
+            or item.get("passed") is not True
+            or int(item.get("candidate_count", -1)) != 584
+            or item.get("violations") not in ([], None)
+            or (view in candidates and candidates[view] != digest)
+        ):
+            raise ValueError("short73 PNN evidence is invalid")
+        candidates[view] = digest
+    candidate_ids = str(
+        freeze.get("audit", {}).get("provisional_evidence", {}).get(
+            "candidate_sample_ids_sha256", ""
+        )
+    )
+    candidates["sample_id"] = candidate_ids
+    if set(candidates) != {"ego", "exo", "sample_id"} or candidates != isolation.get(
+        "pnn_candidate_sha256"
+    ):
+        raise ValueError("short73 PNN candidate identity differs from locked isolation")
+    for name in ("ego", "exo", "sample_id"):
+        if files[name]["sha256"] != candidates[name]:
+            raise ValueError("short73 pixels/IDs differ from the PNN-audited candidate arrays")
+
+
+def validate_formal_input_contract(
+    input_dir: Path,
+    records: Sequence,
+    transition_seconds: float,
+    source_contract: Path,
+) -> dict:
+    if transition_seconds != 0.5:
+        raise ValueError("formal v7 targets require exactly 0.5-second transitions")
+    if source_contract is None:
+        raise ValueError("formal target input requires --source-contract")
+    contract, arrays, files, frame_indices, frame_identity = _validate_source_contract_recursive(
+        source_contract, input_dir
+    )
+    report_path, report = _validate_materialization_report(input_dir, files, frame_identity)
+    if len(frame_indices) != len(records):
+        raise ValueError("formal target frame_index.npy length differs from manifest")
+    sample_ids = arrays["sample_id"]
+    take_uids = arrays["take_uid"]
+    timestamps = arrays["timestamp"]
     for index, record in enumerate(records):
         if (
             record.row_index != index
@@ -201,12 +554,18 @@ def validate_formal_input_contract(
             or abs(float(record.timestamp or 0.0) - float(timestamps[index])) > 1e-3
         ):
             raise ValueError(f"manifest/source row contract differs at index {index}")
+    if report.get("schema") == "fact-short73-materialization-v3":
+        _validate_short73_isolation(input_dir, records, report, files)
     return {
         "materialization_report": str(report_path.resolve()),
         "materialization_report_sha256": sha256_file(report_path),
         "schema": report["schema"],
         "files": files,
         "frame_index": frame_identity,
+        "source_contract": str(source_contract.resolve()),
+        "source_contract_sha256": sha256_file(source_contract),
+        "source_contract_schema": contract["schema"],
+        "producer_evidence": contract["producer_evidence"],
     }
 
 
@@ -244,6 +603,64 @@ def module_state_sha256(module: torch.nn.Module) -> str:
         digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
         digest.update(value.numpy().tobytes())
     return digest.hexdigest()
+
+
+def _tree_code_sha256(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*.py")):
+        if any(part in {".git", "__pycache__"} for part in path.parts):
+            continue
+        digest.update(path.relative_to(directory).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def dino_repository_provenance(torch_home: str | None) -> dict[str, Any]:
+    hub_dir = Path(torch_home).expanduser() / "hub" if torch_home else Path(torch.hub.get_dir())
+    repository = (hub_dir / "facebookresearch_dinov2_main").resolve()
+    result: dict[str, Any] = {"resolved_repo": str(repository), "exists": repository.is_dir()}
+    if not repository.is_dir():
+        return result
+    result["python_code_sha256"] = _tree_code_sha256(repository)
+    if (repository / ".git").exists():
+        for key, command in (
+            ("git_head", ["git", "rev-parse", "HEAD"]),
+            ("git_tree", ["git", "rev-parse", "HEAD^{tree}"]),
+        ):
+            completed = subprocess.run(
+                command,
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            result[key] = completed.stdout.strip()
+    return result
+
+
+def deterministic_runtime_provenance(device: torch.device) -> dict[str, Any]:
+    opencv_version = None
+    for distribution in ("opencv-python", "opencv-python-headless", "opencv-contrib-python"):
+        try:
+            opencv_version = importlib.metadata.version(distribution)
+            break
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return {
+        "device": str(device),
+        "torch": torch.__version__,
+        "torchvision": importlib.metadata.version("torchvision"),
+        "numpy": np.__version__,
+        "opencv": opencv_version,
+        "cuda": torch.version.cuda,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+    }
 
 
 class CameraSidecar:
@@ -331,7 +748,13 @@ def feature_extractor(args: argparse.Namespace, device: torch.device) -> tuple[t
         provenance = {"backend": "mock", "seed": 0, "formal_target": False}
     else:
         model = DINOv2PatchFeatureExtractor(args.dino_model, args.torch_home)
-        provenance = {"backend": "dinov2", "model": args.dino_model, "torch_home": args.torch_home, "formal_target": True}
+        provenance = {
+            "backend": "dinov2",
+            "model": args.dino_model,
+            "torch_home": args.torch_home,
+            "repository": dino_repository_provenance(args.torch_home),
+            "formal_target": True,
+        }
     return model.eval().to(device), provenance
 
 
@@ -357,6 +780,11 @@ def main() -> None:
         raise ValueError("--zero-flow-smoke requires --allow-smoke-targets")
     if not args.zero_flow_smoke and args.raft_weights is None:
         raise ValueError("formal target building requires --raft-weights")
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.use_deterministic_algorithms(True)
     device = torch.device(args.device)
     records = read_manifest_jsonl(args.manifest)
     count = len(records)
@@ -370,8 +798,8 @@ def main() -> None:
         if not args.allow_smoke_targets and args.sample_index_contract is None:
             raise ValueError("formal sample-index targets require --sample-index-contract")
         loaded_indices = np.load(args.sample_index_npy, mmap_mode="r", allow_pickle=False)
-        if loaded_indices.ndim != 1:
-            raise ValueError("sample-index NPY must be a one-dimensional manifest-row vector")
+        if loaded_indices.ndim != 1 or not np.issubdtype(loaded_indices.dtype, np.integer):
+            raise ValueError("sample-index NPY must be a one-dimensional integer manifest-row vector")
         manifest_indices = np.asarray(loaded_indices, dtype=np.int64)
         if len(set(manifest_indices.tolist())) != len(manifest_indices):
             raise ValueError("sample-index NPY contains duplicates")
@@ -383,22 +811,11 @@ def main() -> None:
             "rows": len(manifest_indices),
         }
         if args.sample_index_contract is not None:
-            selection = json.loads(args.sample_index_contract.read_text(encoding="utf-8"))
-            selected_ids = [records[int(index)].sample_id for index in manifest_indices]
-            if (
-                selection.get("schema") != "fact-target-audit-selection-v1"
-                or selection.get("index_sha256") != selection_provenance["sample_index_sha256"]
-                or selection.get("manifest_sha256") != sha256_file(args.manifest)
-                or int(selection.get("sample_count", -1)) != len(manifest_indices)
-                or [str(value) for value in selection.get("sample_ids", [])] != selected_ids
-            ):
-                raise ValueError("sample-index contract does not bind this manifest selection")
-            selection_provenance.update(
-                {
-                    "schema": selection["schema"],
-                    "selection_contract": str(args.sample_index_contract.resolve()),
-                    "selection_contract_sha256": sha256_file(args.sample_index_contract),
-                }
+            selection_provenance = validate_audit_selection_contract(
+                records,
+                manifest_path=args.manifest,
+                index_path=args.sample_index_npy,
+                contract_path=args.sample_index_contract,
             )
     else:
         stop = count if args.limit is None else min(count, args.start + args.limit)
@@ -406,7 +823,9 @@ def main() -> None:
     input_contract = (
         None
         if args.allow_smoke_targets
-        else validate_formal_input_contract(args.input_dir, records, args.transition_seconds)
+        else validate_formal_input_contract(
+            args.input_dir, records, args.transition_seconds, args.source_contract
+        )
     )
     arrays = {view: load_mmap(args.input_dir / f"{view}.npy", count) for view in args.views}
     cameras = {view: CameraSidecar(path, count) for view, path in args.camera_sidecar}
@@ -481,11 +900,13 @@ def main() -> None:
         "claim": "pose-conditioned camera-compensated 2D observed interaction transition representation",
         "depth_available": False,
         "flow_3d_available": False,
+        "runtime": deterministic_runtime_provenance(device),
         "input_transition_contract": input_contract,
         "selection_contract": selection_provenance,
         "source_hashes": {
             "builder_code": sha256_file(Path(__file__)),
             "effect_targets_code": sha256_file(ROOT / "fact_tokenizer" / "effect_targets.py"),
+            "model_code": sha256_file(ROOT / "fact_tokenizer" / "model.py"),
             "manifest": sha256_file(args.manifest),
             "views": {
                 view: (
@@ -552,22 +973,19 @@ def main() -> None:
     if formal_gate_required:
         if args.visual_audit_gate is None:
             raise ValueError("formal target cache or shard requires --visual-audit-gate")
-        gate = json.loads(args.visual_audit_gate.read_text(encoding="utf-8"))
-        if (
-            gate.get("passed") is not True
-            or int(gate.get("rows", 0)) != 50
-            or int(gate.get("fully_aligned", 0)) < 45
-            or float(gate.get("minimum_pass_fraction", 0.0)) < 0.90
-            or float(gate.get("pass_fraction", 0.0)) < 0.90
-        ):
-            raise ValueError("visual audit gate must contain 50 reviewed rows and passed=true")
-        if gate.get("target_identity_sha256") != expected_identity_sha256:
-            raise ValueError("visual audit gate was produced from a different target source/weight identity")
+        gate = validate_visual_audit_gate(
+            args.visual_audit_gate,
+            expected_identity_sha256,
+        )
         formal_release = {
-            "visual_audit_gate_sha256": sha256_file(args.visual_audit_gate),
+            "visual_audit_gate": gate["_gate_path"],
+            "visual_audit_gate_sha256": gate["_gate_sha256"],
+            "visual_audit_gate_schema": gate["schema"],
             "review_rows": int(gate["rows"]),
             "pass_fraction": float(gate["pass_fraction"]),
             "target_identity_sha256": gate["target_identity_sha256"],
+            "review_csv_sha256": gate["review_csv_sha256"],
+            "audit_pack_sha256": gate["audit_pack_sha256"],
         }
     writer = EffectTargetCacheWriter(
         args.output_dir,
@@ -597,6 +1015,8 @@ def main() -> None:
             "sample_key": record.sample_key,
             "take_uid": record.take_uid,
             "timestamp": record.timestamp,
+            "split": record.split,
+            "row_index": record.row_index,
             "annotation_refs": dict(record.annotation_refs),
             "capability_validity": {key.value: bool(value) for key, value in record.capability_validity.items()},
         }

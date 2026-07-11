@@ -14,6 +14,7 @@ from fact_tokenizer.locked_split import (
     audit_locked_samples,
     build_short_locked_samples,
     perceptual_nearest_neighbor_audit,
+    validate_final_freeze_candidate_contract,
     write_frozen_locked_manifest,
 )
 
@@ -162,3 +163,54 @@ def test_short73_cli_bootstraps_repo_imports() -> None:
         text=True,
     )
     assert "--stage" in completed.stdout
+
+
+def test_short73_materializer_requires_exact_dual_view_pnn_candidate_contract() -> None:
+    freeze = {
+        "freeze_stage": "final",
+        "evaluation_allowed": True,
+        "final_inference_only": True,
+        "training_valid": False,
+        "model_selection_valid": False,
+        "samples": 584,
+        "takes": 73,
+        "audit": {
+            "passed": True,
+            "provisional_evidence": {"candidate_sample_ids_sha256": "c" * 64},
+            "perceptual_nearest_neighbor": {
+                "status": "complete",
+                "reports": [
+                    {
+                        "view": "ego",
+                        "candidate_sha256": "a" * 64,
+                        "candidate_count": 584,
+                        "passed": True,
+                        "violations": [],
+                    },
+                    {
+                        "view": "exo",
+                        "candidate_sha256": "b" * 64,
+                        "candidate_count": 584,
+                        "passed": True,
+                        "violations": [],
+                    },
+                ],
+            },
+        },
+    }
+    assert validate_final_freeze_candidate_contract(freeze, 584) == {
+        "ego": "a" * 64,
+        "exo": "b" * 64,
+        "sample_id": "c" * 64,
+    }
+    freeze["audit"]["perceptual_nearest_neighbor"]["reports"].append(
+        {
+            "view": "ego",
+            "candidate_sha256": "d" * 64,
+            "candidate_count": 584,
+            "passed": True,
+            "violations": [],
+        }
+    )
+    with pytest.raises(ValueError, match="disagree"):
+        validate_final_freeze_candidate_contract(freeze, 584)

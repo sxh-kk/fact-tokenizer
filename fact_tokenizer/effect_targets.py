@@ -836,14 +836,55 @@ def verify_target_cache(output_dir: Path | str) -> list[str]:
     errors: list[str] = []
     if not config_path.is_file():
         return [f"missing {config_path}"]
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not manifest.is_file():
+        return [f"missing {manifest}"]
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"invalid {config_path}: {exc}"]
     expected_config = config.get("config_sha256")
     expected_identity = config.get("identity_sha256")
+    config_payload = config.get("config")
+    identity_payload = config.get("identity")
+    if not isinstance(config_payload, dict):
+        errors.append("target_config.json lacks a config object")
+        computed_config = None
+    else:
+        computed_config = hashlib.sha256(
+            json.dumps(config_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if expected_config != computed_config:
+            errors.append("target_config.json config_sha256 does not match its config payload")
+        if config.get("target_cache_version") != config_payload.get("target_cache_version"):
+            errors.append("target cache version differs between top-level metadata and config payload")
+    if not isinstance(identity_payload, dict):
+        errors.append("target_config.json lacks an identity object")
+        computed_identity = None
+    elif computed_config is None:
+        computed_identity = None
+    else:
+        computed_identity = hashlib.sha256(
+            json.dumps(
+                {"config_sha256": computed_config, "sources": identity_payload},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if expected_identity != computed_identity:
+            errors.append("target_config.json identity_sha256 does not match its identity payload")
     seen: set[str] = set()
+    samples_root = (root / "samples").resolve()
     with manifest.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            record = json.loads(line)
-            sample_id = str(record["sample_id"])
+            if not line.strip():
+                errors.append(f"line {line_number}: blank target-manifest record")
+                continue
+            try:
+                record = json.loads(line)
+                sample_id = str(record["sample_id"])
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                errors.append(f"line {line_number}: invalid target-manifest record: {exc}")
+                continue
             if sample_id in seen:
                 errors.append(f"line {line_number}: duplicate sample_id={sample_id}")
             seen.add(sample_id)
@@ -851,13 +892,28 @@ def verify_target_cache(output_dir: Path | str) -> list[str]:
                 errors.append(f"line {line_number}: config identity mismatch for {sample_id}")
             if record.get("identity_sha256") != expected_identity:
                 errors.append(f"line {line_number}: source identity mismatch for {sample_id}")
-            path = root / record["path"]
+            relative_path = record.get("path")
+            expected_path = f"samples/{EffectTargetCacheWriter._filename(sample_id)}"
+            if not isinstance(relative_path, str) or Path(relative_path).as_posix() != expected_path:
+                errors.append(f"line {line_number}: non-canonical target path for {sample_id}")
+                continue
+            path = (root / relative_path).resolve()
+            try:
+                path.relative_to(samples_root)
+            except ValueError:
+                errors.append(f"line {line_number}: target path escapes samples directory for {sample_id}")
+                continue
             if not path.is_file():
                 errors.append(f"line {line_number}: missing {path}")
                 continue
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            if digest != record["sha256"]:
+            if digest != record.get("sha256"):
                 errors.append(f"line {line_number}: sha256 mismatch for {sample_id}")
+    declared_samples = config.get("samples")
+    if not isinstance(declared_samples, int) or declared_samples != len(seen):
+        errors.append(
+            f"target_config.json samples={declared_samples!r} differs from manifest count={len(seen)}"
+        )
     return errors
 
 

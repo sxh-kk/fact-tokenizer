@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,7 @@ from fact_tokenizer.effect_targets import (
 from fact_tokenizer.effect_manifest import EffectCapability, EffectSampleRecord, write_manifest_jsonl
 from scripts.audit_fact_effect_targets import validate as validate_visual_audit
 from scripts.build_fact_effect_targets import npy_identity, validate_formal_input_contract
+from tests._target_audit_fixture import make_visual_audit_v2
 
 
 def test_scale_intrinsics_uses_independent_xy_scales() -> None:
@@ -74,6 +76,103 @@ def test_formal_target_input_binds_exact_frame_sidecar_and_manifest(tmp_path: Pa
     (tmp_path / "materialization_report.json").write_text(
         json.dumps(report), encoding="utf-8"
     )
+    audited_ids = sorted(sample_ids.tolist())
+    frame_rows = [
+        {"sample_id": sample_ids[index], "take_uid": take_uids[index], "frame_index": int([30, 60][index])}
+        for index in range(2)
+    ]
+    frame_rows_text = "".join(
+        f"{row['sample_id']}\t{row['take_uid']}\t{row['frame_index']}\n" for row in frame_rows
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    audit_code = repo_root / "scripts" / "audit_fact_npy_source_semantics.py"
+    decoder_code = repo_root / "scripts" / "prepare_fact_egoexo_npz.py"
+    video_map = tmp_path / "video_map.jsonl"
+    video_map.write_text("{}\n", encoding="utf-8")
+    gold_manifest = tmp_path / "gold_manifest.jsonl"
+    gold_manifest.write_text("{}\n", encoding="utf-8")
+    video_inventory = []
+    for take_uid in take_uids:
+        item = {"take_uid": str(take_uid)}
+        for view in ("ego", "exo"):
+            path = tmp_path / f"{take_uid}_{view}.mp4"
+            path.write_bytes(f"{take_uid}:{view}".encode())
+            item[f"{view}_path"] = str(path.resolve())
+            item[f"{view}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        video_inventory.append(item)
+    semantic_report = tmp_path / "semantic_report.json"
+    semantic_report.write_text(
+        json.dumps(
+            {
+                "schema": "fact-npy-source-semantic-audit-v1",
+                "passed": True,
+                "source_dir": str(tmp_path.resolve()),
+                "rows": 2,
+                "files": files,
+                "color_space": "RGB",
+                "transition_seconds": 0.5,
+                "endpoint_semantics": ["t", "t+0.5s"],
+                "resize": 224,
+                "frame_selection_mode": "frozen_frame_index_sidecar",
+                "frame_rate_hz": 30.0,
+                "endpoint_offset_frames": 15,
+                "maximum_t0_timestamp_distance_frames": 0.0,
+                "frame_index_npy": str((tmp_path / "frame_index.npy").resolve()),
+                "frame_index": report["frame_index"],
+                "materialization_report": str((tmp_path / "materialization_report.json").resolve()),
+                "materialization_report_sha256": hashlib.sha256(
+                    (tmp_path / "materialization_report.json").read_bytes()
+                ).hexdigest(),
+                "audited_sample_ids": audited_ids,
+                "audited_sample_ids_sha256": hashlib.sha256(
+                    "".join(value + "\n" for value in audited_ids).encode()
+                ).hexdigest(),
+                "audited_samples": 2,
+                "exact_view_pair_matches": 4,
+                "audited_frame_rows": frame_rows,
+                "audited_frame_rows_sha256": hashlib.sha256(frame_rows_text.encode()).hexdigest(),
+                "audit_code_sha256": hashlib.sha256(audit_code.read_bytes()).hexdigest(),
+                "decoder_code_sha256": hashlib.sha256(decoder_code.read_bytes()).hexdigest(),
+                "video_map_jsonl": str(video_map.resolve()),
+                "video_map_sha256": hashlib.sha256(video_map.read_bytes()).hexdigest(),
+                "gold_manifest": str(gold_manifest.resolve()),
+                "gold_manifest_sha256": hashlib.sha256(gold_manifest.read_bytes()).hexdigest(),
+                "included_splits": ["train"],
+                "video_inventory": video_inventory,
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_contract = tmp_path / "source_contract.json"
+    source_contract.write_text(
+        json.dumps(
+            {
+                "schema": "fact-npy-source-contract-v1",
+                "source_dir": str(tmp_path.resolve()),
+                "rows": 2,
+                "color_space": "RGB",
+                "transition_seconds": 0.5,
+                "endpoint_semantics": ["t", "t+0.5s"],
+                "files": files,
+                "frame_index": report["frame_index"],
+                "audited_sample_ids": audited_ids,
+                "audited_sample_ids_sha256": hashlib.sha256(
+                    "".join(value + "\n" for value in audited_ids).encode()
+                ).hexdigest(),
+                "producer_evidence": {
+                    "mode": "semantic_audit_against_raw_videos",
+                    "producer_report": str(semantic_report),
+                    "producer_report_sha256": hashlib.sha256(semantic_report.read_bytes()).hexdigest(),
+                    "producer_code_sha256": {
+                        "scripts/audit_fact_npy_source_semantics.py": hashlib.sha256(
+                            audit_code.read_bytes()
+                        ).hexdigest()
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     records = [
         EffectSampleRecord(
             sample_id=str(sample_ids[index]),
@@ -85,11 +184,17 @@ def test_formal_target_input_binds_exact_frame_sidecar_and_manifest(tmp_path: Pa
         )
         for index in range(2)
     ]
-    identity = validate_formal_input_contract(tmp_path, records, 0.5)
+    identity = validate_formal_input_contract(tmp_path, records, 0.5, source_contract)
+    assert identity["source_contract_sha256"] == hashlib.sha256(source_contract.read_bytes()).hexdigest()
+    semantic_bytes = semantic_report.read_bytes()
+    semantic_report.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="producer report hash"):
+        validate_formal_input_contract(tmp_path, records, 0.5, source_contract)
+    semantic_report.write_bytes(semantic_bytes)
     assert identity["frame_index"]["sha256"] == report["frame_index"]["sha256"]
     np.save(tmp_path / "frame_index.npy", np.asarray([31, 60], dtype=np.int64))
-    with pytest.raises(ValueError, match="frame index"):
-        validate_formal_input_contract(tmp_path, records, 0.5)
+    with pytest.raises(ValueError, match="materialization|source contract|frame"):
+        validate_formal_input_contract(tmp_path, records, 0.5, source_contract)
 
 
 def test_pose_alignment_accepts_one_frame_and_rejects_more() -> None:
@@ -206,6 +311,35 @@ def test_target_cache_is_versioned_hashed_and_rejects_3d(tmp_path: Path) -> None
         writer.write("bad-valid", {"depth_valid": True})
 
 
+@pytest.mark.parametrize("tamper", ["config", "identity", "samples", "path"])
+def test_target_cache_verifier_recomputes_identity_and_rejects_path_escape(
+    tmp_path: Path, tamper: str
+) -> None:
+    writer = EffectTargetCacheWriter(
+        tmp_path,
+        EffectTargetConfig(),
+        identity={"source_hashes": {"manifest": "a" * 64}},
+    )
+    writer.write("sample", {"depth_valid": False, "flow_3d_valid": False})
+    writer.finalize()
+    config_path = tmp_path / "target_config.json"
+    manifest_path = tmp_path / "target_manifest.jsonl"
+    if tamper in {"config", "identity", "samples"}:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if tamper == "config":
+            config["config"]["transition_seconds"] = 1.0
+        elif tamper == "identity":
+            config["identity"]["source_hashes"]["manifest"] = "b" * 64
+        else:
+            config["samples"] = 2
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+    else:
+        record = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record["path"] = "../outside.npz"
+        manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    assert verify_target_cache(tmp_path)
+
+
 def test_target_cache_resume_binds_source_and_weight_identity(tmp_path: Path) -> None:
     config = EffectTargetConfig()
     writer = EffectTargetCacheWriter(tmp_path, config, identity={"raft_sha256": "a" * 64})
@@ -310,47 +444,31 @@ def test_weak_calibration_is_bound_to_all_60_dev_samples(tmp_path: Path) -> None
 
 
 def test_disjoint_target_shards_merge_atomically_with_one_identity(tmp_path: Path) -> None:
-    for index in range(2):
+    audit = make_visual_audit_v2(tmp_path / "audit")
+    for shard_index in range(2):
         writer = EffectTargetCacheWriter(
-            tmp_path / f"shard{index}",
+            tmp_path / f"shard{shard_index}",
             EffectTargetConfig(),
-            identity={"source": "same"},
+            identity=audit["identity"],
         )
-        writer.write(
-            f"s{index}",
-            {
-                "depth_valid": False,
-                "flow_3d_valid": False,
-                "ego_full_dino_delta": np.zeros((1, 2), dtype=np.float32),
-                "ego_full_dino_delta_valid": True,
-            },
-        )
+        for record in audit["records"][shard_index * 25 : (shard_index + 1) * 25]:
+            writer.write(
+                record.sample_id,
+                {
+                    "depth_valid": False,
+                    "flow_3d_valid": False,
+                    "ego_full_dino_delta": np.zeros((1, 2), dtype=np.float32),
+                    "ego_full_dino_delta_valid": True,
+                },
+                metadata={
+                    "sample_key": record.sample_key,
+                    "take_uid": record.take_uid,
+                    "split": record.split,
+                    "row_index": record.row_index,
+                    "timestamp": record.timestamp,
+                },
+            )
         writer.finalize()
-    expected_manifest = tmp_path / "expected.jsonl"
-    write_manifest_jsonl(
-        expected_manifest,
-        [
-            EffectSampleRecord(sample_id=f"s{index}", take_uid=f"t{index}", split="train", row_index=index)
-            for index in range(2)
-        ],
-    )
-    identity = json.loads((tmp_path / "shard0" / "target_config.json").read_text(encoding="utf-8"))[
-        "identity_sha256"
-    ]
-    gate = tmp_path / "gate.json"
-    gate.write_text(
-        json.dumps(
-            {
-                "passed": True,
-                "rows": 50,
-                "fully_aligned": 45,
-                "minimum_pass_fraction": 0.90,
-                "pass_fraction": 0.90,
-                "target_identity_sha256": identity,
-            }
-        ),
-        encoding="utf-8",
-    )
     merged = tmp_path / "merged"
     subprocess.run(
         [
@@ -363,9 +481,9 @@ def test_disjoint_target_shards_merge_atomically_with_one_identity(tmp_path: Pat
             "--output-dir",
             str(merged),
             "--expected-manifest",
-            str(expected_manifest),
+            str(audit["manifest"]),
             "--visual-audit-gate",
-            str(gate),
+            str(audit["gate"]),
         ],
         cwd=Path(__file__).resolve().parents[1],
         check=True,
@@ -373,7 +491,7 @@ def test_disjoint_target_shards_merge_atomically_with_one_identity(tmp_path: Pat
         text=True,
     )
     assert verify_target_cache(merged) == []
-    assert json.loads((merged / "target_config.json").read_text(encoding="utf-8"))["samples"] == 2
+    assert json.loads((merged / "target_config.json").read_text(encoding="utf-8"))["samples"] == 50
 
 
 def test_visual_audit_threshold_cannot_be_lowered_below_90_percent(tmp_path: Path) -> None:
@@ -409,8 +527,6 @@ def test_visual_audit_threshold_cannot_be_lowered_below_90_percent(tmp_path: Pat
     )
     with pytest.raises(ValueError, match="cannot be below"):
         validate_visual_audit(review, 0.09)
-    report = validate_visual_audit(review, 0.90)
-    assert report["fully_aligned"] == 45 and report["passed"] is True
 
 
 def test_target_builder_smoke_writes_dino_flow_roi_and_no_3d(tmp_path: Path) -> None:

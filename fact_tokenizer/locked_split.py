@@ -452,3 +452,49 @@ def write_frozen_locked_manifest(
     temp.write_text(json.dumps(freeze, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     temp.replace(freeze_path)
     return freeze
+
+
+def validate_final_freeze_candidate_contract(
+    freeze: Mapping[str, Any], sample_count: int
+) -> dict[str, str]:
+    """Return exact candidate-array hashes accepted by a final dual-view PNN audit."""
+
+    if freeze.get("freeze_stage") != "final":
+        return {}
+    if (
+        freeze.get("evaluation_allowed") is not True
+        or freeze.get("final_inference_only") is not True
+        or freeze.get("training_valid") is not False
+        or freeze.get("model_selection_valid") is not False
+        or freeze.get("audit", {}).get("passed") is not True
+        or int(freeze.get("samples", -1)) != sample_count
+        or int(freeze.get("takes", -1)) != 73
+    ):
+        raise ValueError("final short73 freeze lacks its locked evaluation/isolation contract")
+    pnn = freeze["audit"].get("perceptual_nearest_neighbor", {})
+    reports = pnn.get("reports", [])
+    if pnn.get("status") != "complete" or not isinstance(reports, list) or not reports:
+        raise ValueError("final short73 freeze lacks a completed PNN audit")
+    candidates: dict[str, str] = {}
+    for report in reports:
+        view = str(report.get("view", ""))
+        candidate_sha256 = str(report.get("candidate_sha256", ""))
+        if (
+            view not in {"ego", "exo"}
+            or len(candidate_sha256) != 64
+            or report.get("passed") is not True
+            or int(report.get("candidate_count", -1)) != sample_count
+            or report.get("violations") not in ([], None)
+        ):
+            raise ValueError("final short73 freeze contains an invalid PNN report")
+        previous = candidates.setdefault(view, candidate_sha256)
+        if previous != candidate_sha256:
+            raise ValueError(f"PNN reports disagree on the {view} candidate SHA256")
+    if set(candidates) != {"ego", "exo"}:
+        raise ValueError("final short73 PNN audit must bind both ego and exo candidates")
+    provisional = freeze["audit"].get("provisional_evidence", {})
+    sample_id_sha256 = str(provisional.get("candidate_sample_ids_sha256", ""))
+    if len(sample_id_sha256) != 64:
+        raise ValueError("final short73 freeze does not bind the audited candidate sample IDs")
+    candidates["sample_id"] = sample_id_sha256
+    return candidates

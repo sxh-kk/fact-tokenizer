@@ -77,8 +77,9 @@ def main() -> None:
     ):
         raise ValueError("parent frame_index.npy is missing, invalid, or no longer hash-bound")
     indices = np.load(args.row_index_npy, mmap_mode="r", allow_pickle=False)
-    if indices.ndim != 1:
-        raise ValueError("row index must be one-dimensional")
+    if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError("row index must be a one-dimensional integer array")
+    source_index_dtype = str(indices.dtype)
     indices = np.asarray(indices, dtype=np.int64)
     if len(np.unique(indices)) != len(indices) or (indices < 0).any() or (indices >= len(parent["sample_id"])).any():
         raise ValueError("row index has duplicates or out-of-range values")
@@ -116,6 +117,7 @@ def main() -> None:
             "parent_report_sha256": sha256_file(parent_report_path),
             "row_index_npy": str(args.row_index_npy),
             "row_index_sha256": sha256_file(args.row_index_npy),
+            "row_index_dtype": source_index_dtype,
             "metadata_reference_dir": str(args.metadata_reference_dir),
             "rows": len(indices),
             "color_space": "RGB",

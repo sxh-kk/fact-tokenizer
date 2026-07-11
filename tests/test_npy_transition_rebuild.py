@@ -82,6 +82,27 @@ def test_materialize_transition_subset_preserves_frozen_row_order(tmp_path: Path
     assert report["transition_seconds"] == 0.5
     assert report["rows"] == 2
     assert report["frame_index"] == identity(output, "frame_index")
+    float_index_path = tmp_path / "float_index.npy"
+    np.save(float_index_path, indices.astype(np.float64))
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            "scripts/materialize_fact_npy_subset.py",
+            "--parent-dir",
+            str(parent),
+            "--row-index-npy",
+            str(float_index_path),
+            "--metadata-reference-dir",
+            str(reference),
+            "--output-dir",
+            str(tmp_path / "float_subset"),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "integer array" in rejected.stderr
 
 
 def test_materialize_transition_subset_rejects_tampered_frame_index(tmp_path: Path) -> None:
