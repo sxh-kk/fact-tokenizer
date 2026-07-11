@@ -185,6 +185,7 @@ def validate_formal_target_cache(
         or runtime.get("cudnn_benchmark") is not False
         or runtime.get("cudnn_allow_tf32") is not False
         or runtime.get("cuda_matmul_allow_tf32") is not False
+        or runtime.get("cublas_workspace_config") not in {":4096:8", ":16:8"}
     ):
         raise ValueError("formal target cache lacks deterministic target-build provenance")
     sources = identity.get("source_hashes", {})

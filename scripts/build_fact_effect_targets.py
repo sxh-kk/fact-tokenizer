@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -660,6 +661,7 @@ def deterministic_runtime_provenance(device: torch.device) -> dict[str, Any]:
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
         "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
         "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
     }
 
 
@@ -780,6 +782,7 @@ def main() -> None:
         raise ValueError("--zero-flow-smoke requires --allow-smoke-targets")
     if not args.zero_flow_smoke and args.raft_weights is None:
         raise ValueError("formal target building requires --raft-weights")
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.allow_tf32 = False
