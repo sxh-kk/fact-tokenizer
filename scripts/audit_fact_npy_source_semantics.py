@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-map-jsonl", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
     parser.add_argument("--resize", type=int, default=224)
+    parser.add_argument("--transition-seconds", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -136,7 +137,12 @@ def main() -> None:
             raise RuntimeError(f"cannot open raw videos for {take_uid}")
         try:
             decoded_by_view = {
-                view: read_pairs_sequential(capture, by_take[take_uid], 0.5, args.resize)
+                view: read_pairs_sequential(
+                    capture,
+                    by_take[take_uid],
+                    args.transition_seconds,
+                    args.resize,
+                )
                 for view, capture in captures.items()
             }
             for row in sorted(by_take[take_uid], key=lambda value: value["timestamp"]):
@@ -179,8 +185,8 @@ def main() -> None:
         "audited_samples": len(sorted_ids),
         "exact_view_pair_matches": exact_matches,
         "color_space": "RGB",
-        "transition_seconds": 0.5,
-        "endpoint_semantics": ["t", "t+0.5s"],
+        "transition_seconds": args.transition_seconds,
+        "endpoint_semantics": ["t", f"t+{args.transition_seconds:g}s"],
         "resize": args.resize,
         "frame_selection": "round(timestamp_seconds * 30Hz), sequential decode from frame zero",
         "video_inventory": video_inventory,

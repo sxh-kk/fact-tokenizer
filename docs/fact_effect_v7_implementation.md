@@ -16,6 +16,17 @@ cross-embodiment validity.
   argument.
 - The final state dict contains no VQ/codebook state.
 
+## Migrated NPY transition correction
+
+The filtering-v2 snapshot must not be used directly as a v7 video source:
+raw-video reconstruction showed its second endpoint is `t+1.0s` despite the
+historical directory name containing `t0p5`. Use
+`rebuild_fact_npy_transition.py` to decode the complete no-filter source at an
+explicit 0.5 seconds, then `materialize_fact_npy_subset.py` to derive filtered
+rows by the frozen source-row index. Both publish atomically with content and
+raw-video provenance hashes. Any target cache built from the legacy arrays is
+diagnostic-only and must be rebuilt.
+
 ## Build order
 
 1. Build base manifests with `scripts/build_fact_effect_manifest.py`.
