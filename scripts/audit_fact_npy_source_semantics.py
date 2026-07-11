@@ -59,7 +59,10 @@ def read_pairs_sequential(
         for endpoint, value in enumerate(
             (float(row["timestamp"]), float(row["timestamp"]) + transition_seconds)
         ):
-            needed[int(round(value * fps))].append((int(row["source_index"]), endpoint))
+            # Historical materialization used nearest-frame, half-up semantics.
+            # Python's built-in round is bankers rounding and selects frame 10
+            # for an exact 10.5 timestamp, while the frozen data selects 11.
+            needed[int(np.floor(value * fps + 0.5))].append((int(row["source_index"]), endpoint))
     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
     for frame_index in range(max(needed) + 1):
         ok, frame = capture.read()
@@ -188,7 +191,7 @@ def main() -> None:
         "transition_seconds": args.transition_seconds,
         "endpoint_semantics": ["t", f"t+{args.transition_seconds:g}s"],
         "resize": args.resize,
-        "frame_selection": "round(timestamp_seconds * 30Hz), sequential decode from frame zero",
+        "frame_selection": "floor(timestamp_seconds * 30Hz + 0.5), sequential decode from frame zero",
         "video_inventory": video_inventory,
         "video_map_jsonl": str(args.video_map_jsonl),
         "video_map_sha256": sha256_file(args.video_map_jsonl),
