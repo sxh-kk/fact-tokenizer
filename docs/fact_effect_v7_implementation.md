@@ -1,5 +1,7 @@
 # FACT v7 continuous effect implementation
 
+[中文版本](fact_effect_v7_implementation.zh-CN.md)
+
 This branch is an isolated, VQ-off implementation of a
 pose-conditioned, camera-compensated 2D observed interaction transition
 representation. It does not claim depth, dense 3D flow, physical causality, or
@@ -22,13 +24,14 @@ The filtering-v2 snapshot must not be used directly as a v7 video source.
 Raw-video reconstruction showed that the complete no-filter arrays are already
 `t+0.5s`, while the independently materialized filtering-v2 arrays use
 `t+1.0s` despite the historical directory name containing `t0p5`. Use
-`rebuild_fact_npy_transition.py --source-transition-seconds 0.5` to anchor and
-hash-bind every no-filter endpoint to exact raw-video frame indices, then use
-`materialize_fact_npy_subset.py` to derive filtered rows by the frozen source
-row index. The rebuild CLI requires the empirically verified source spacing so
-the two legacy families cannot be confused. Both tools publish atomically with
-content and raw-video provenance hashes. Any target cache built from the
-legacy filtered arrays is diagnostic-only and must be rebuilt.
+`python scripts/rebuild_fact_npy_transition.py --source-transition-seconds 0.5`
+to anchor and hash-bind every no-filter endpoint to exact raw-video frame
+indices, then use `python scripts/materialize_fact_npy_subset.py` to derive
+filtered rows by the frozen source row index. The rebuild CLI requires the
+empirically verified source spacing so the two legacy families cannot be
+confused. Both tools publish atomically with content and raw-video provenance
+hashes. Any target cache built from the legacy filtered arrays is
+diagnostic-only and must be rebuilt.
 
 ## Build order
 
@@ -49,7 +52,8 @@ legacy filtered arrays is diagnostic-only and must be rebuilt.
    `scripts/audit_fact_effect_targets.py`. Validation emits a cache-identity
    bound gate. Every later formal full cache or shard must supply that gate;
    only the hash-bound 50-row audit selection may be built before it.
-   bound gate only after at least 45/50 rows pass all alignment checks.
+   Validation releases the hash-bound gate only after at least 45/50 rows pass
+   all alignment checks.
 8. Build the full formal cache with `--visual-audit-gate ...`. A full formal
    build fails without that gate. Independent shards are merged only through
    `scripts/merge_fact_effect_target_shards.py`.

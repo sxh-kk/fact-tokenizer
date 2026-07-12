@@ -3,6 +3,8 @@
 [English](README.md)
 
 连续、VQ-off 的 FACT v7 effect 实现见
+[`docs/fact_effect_v7_implementation.zh-CN.md`](docs/fact_effect_v7_implementation.zh-CN.md)；
+英文原版见
 [`docs/fact_effect_v7_implementation.md`](docs/fact_effect_v7_implementation.md)。
 gold300 人工标注请从
 [`标注者上手指南`](docs/fact_gold300_annotator_guide.zh-CN.md)开始；数据管理员另见
