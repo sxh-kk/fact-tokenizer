@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from datetime import timedelta
 import hashlib
 import json
 import os
@@ -597,14 +598,56 @@ def validate_p1_cache_binding(
         raise ValueError("P1 provenance target identity differs from the active target cache")
 
 
+def distributed_timeout_seconds() -> int:
+    try:
+        seconds = int(os.environ.get("FACT_DDP_TIMEOUT_SECONDS", "120"))
+    except ValueError as error:
+        raise ValueError("FACT_DDP_TIMEOUT_SECONDS must be an integer") from error
+    if not 30 <= seconds <= 3600:
+        raise ValueError("FACT_DDP_TIMEOUT_SECONDS must be between 30 and 3600")
+    return seconds
+
+
 def init_distributed() -> tuple[int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size > 1:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
+        cuda_available = torch.cuda.is_available()
+        backend = "nccl" if cuda_available else "gloo"
+        # NCCL may create its communicator on the current CUDA device during
+        # process-group initialization. Bind each rank first so two local ranks
+        # cannot both initialize against the default physical GPU 0.
+        if cuda_available:
+            torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend=backend,
+            timeout=timedelta(seconds=distributed_timeout_seconds()),
+        )
     return world_size, rank, local_rank
+
+
+def wrap_distributed_model(
+    model: torch.nn.Module,
+    *,
+    world_size: int,
+    local_rank: int,
+    device: torch.device,
+) -> torch.nn.Module:
+    """Wrap v7 for DDP while supporting experiment-specific inactive branches.
+
+    Continuous v7 intentionally keeps contact/phase heads and, for no-private
+    experiments, private encoders in the state dict even when the active
+    objective does not use them. DDP must therefore discover unused parameters
+    instead of waiting for gradients that cannot be produced.
+    """
+
+    if world_size <= 1:
+        return model
+    kwargs: dict[str, object] = {"find_unused_parameters": True}
+    if device.type == "cuda":
+        kwargs["device_ids"] = [local_rank]
+    return DistributedDataParallel(model, **kwargs)
 
 
 def main() -> None:
@@ -872,7 +915,12 @@ def main() -> None:
     ).to(device)
     if any("vq" in key.lower() or "codebook" in key.lower() for key in model.state_dict()):
         raise AssertionError("continuous v7 state dict unexpectedly contains VQ/codebook state")
-    ddp_model = DistributedDataParallel(model, device_ids=[local_rank]) if world_size > 1 else model
+    ddp_model = wrap_distributed_model(
+        model,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+    )
     objective_config = objective_for_spec(args.experiment, args.enable_weak_semantics, weak_precision)
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
@@ -886,6 +934,11 @@ def main() -> None:
         "seed": args.seed,
         "global_batch": args.micro_batch * args.gradient_accumulation * world_size,
         "world_size": world_size,
+        "ddp_find_unused_parameters": world_size > 1,
+        "distributed_backend": dist.get_backend() if world_size > 1 else None,
+        "distributed_timeout_seconds": (
+            distributed_timeout_seconds() if world_size > 1 else None
+        ),
         "gradient_accumulation": args.gradient_accumulation,
         "quality_sampling": args.quality_sampling,
         "learning_rate": args.learning_rate,
@@ -956,6 +1009,9 @@ def main() -> None:
             "steps",
             "global_batch",
             "world_size",
+            "ddp_find_unused_parameters",
+            "distributed_backend",
+            "distributed_timeout_seconds",
             "gradient_accumulation",
             "step_unit",
             "learning_rate",
@@ -990,12 +1046,21 @@ def main() -> None:
     run_fingerprint = json.loads(json.dumps(run_fingerprint, sort_keys=True))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config_path = args.output_dir / "run_config.json"
-    if config_path.exists():
-        existing = json.loads(config_path.read_text(encoding="utf-8"))
-        if existing != run_fingerprint:
-            raise ValueError("run directory already contains a different frozen configuration")
-    else:
-        config_path.write_text(json.dumps(run_fingerprint, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if rank == 0:
+        if config_path.exists():
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+            if existing != run_fingerprint:
+                raise ValueError("run directory already contains a different frozen configuration")
+        else:
+            config_path.write_text(
+                json.dumps(run_fingerprint, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+    if world_size > 1:
+        dist.barrier()
+    existing = json.loads(config_path.read_text(encoding="utf-8"))
+    if existing != run_fingerprint:
+        raise ValueError("run directory contains a different frozen configuration")
 
     start_step = 0
     if args.resume:

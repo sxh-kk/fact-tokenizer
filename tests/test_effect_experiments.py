@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -32,11 +33,51 @@ from fact_tokenizer.paired_eligibility import (
 )
 from scripts.train_fact_effect_v7 import (
     DeterministicDistributedWeightedSampler,
+    distributed_timeout_seconds,
+    init_distributed,
     load_excluded_takes,
     nuisance_inputs,
     require_control_assets,
     validate_formal_target_cache,
 )
+
+
+def test_nccl_binds_local_device_before_process_group_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("FACT_DDP_TIMEOUT_SECONDS", "47")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_device",
+        lambda rank: events.append(("set_device", rank)),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **kwargs: events.append(("init_process_group", kwargs)),
+    )
+
+    assert init_distributed() == (2, 1, 1)
+    assert events[0] == ("set_device", 1)
+    assert events[1][0] == "init_process_group"
+    kwargs = events[1][1]
+    assert isinstance(kwargs, dict)
+    assert kwargs["backend"] == "nccl"
+    assert kwargs["timeout"].total_seconds() == 47
+    assert distributed_timeout_seconds() == 47
+
+
+def test_distributed_timeout_contract_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FACT_DDP_TIMEOUT_SECONDS", "29")
+    with pytest.raises(ValueError, match="between 30 and 3600"):
+        distributed_timeout_seconds()
 
 
 def test_preregistered_experiment_matrix_and_batch_contract() -> None:
@@ -376,6 +417,111 @@ def test_training_script_one_step_continuous_smoke(tmp_path: Path) -> None:
     assert extracted.shape == (count, 4)
     metadata = json.loads((feature_dir / "feature_metadata.json").read_text(encoding="utf-8"))
     assert metadata["encoder_frozen"] is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="torchrun gloo rendezvous is not reliable on Windows CI")
+def test_training_script_two_rank_handles_inactive_branches(tmp_path: Path) -> None:
+    """DDP must survive branches that are intentionally inactive in C2."""
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    rng = np.random.default_rng(9)
+    count = 4
+    for view in ("ego", "exo"):
+        np.save(input_dir / f"{view}.npy", rng.integers(0, 255, (count, 2, 28, 28, 3), dtype=np.uint8))
+    np.save(input_dir / "sample_id.npy", np.asarray([f"s{index}" for index in range(count)]))
+    np.save(input_dir / "take_uid.npy", np.asarray([f"t{index // 2}" for index in range(count)]))
+    np.save(input_dir / "timestamp.npy", np.arange(count, dtype=np.float32))
+    manifest = tmp_path / "manifest.jsonl"
+    write_manifest_jsonl(
+        manifest,
+        [
+            EffectSampleRecord(
+                sample_id=f"s{index}",
+                take_uid=f"t{index // 2}",
+                split="train",
+                row_index=index,
+                timestamp=float(index),
+                capability_validity={EffectCapability.RGB_PAIRED: True},
+            )
+            for index in range(count)
+        ],
+    )
+    cache_dir = tmp_path / "cache"
+    writer = EffectTargetCacheWriter(cache_dir, EffectTargetConfig())
+    for index in range(count):
+        targets = {"depth_valid": False, "flow_3d_valid": False}
+        for view in ("ego", "exo"):
+            targets[f"{view}_full_dino_delta"] = np.zeros((256, 8), dtype=np.float32)
+            targets[f"{view}_full_dino_delta_valid"] = True
+        writer.write(f"s{index}", targets)
+    writer.finalize()
+    output = tmp_path / "ddp-run"
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    environment["OMP_NUM_THREADS"] = "1"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nnodes=1",
+            "--nproc_per_node=2",
+            "scripts/train_fact_effect_v7.py",
+            "--experiment",
+            "C2",
+            "--stage",
+            "smoke",
+            "--input-dir",
+            str(input_dir),
+            "--manifest",
+            str(manifest),
+            "--target-cache",
+            str(cache_dir),
+            "--output-dir",
+            str(output),
+            "--seed",
+            "42",
+            "--steps",
+            "2",
+            "--micro-batch",
+            "1",
+            "--gradient-accumulation",
+            "1",
+            "--num-workers",
+            "0",
+            "--backbone",
+            "mock",
+            "--backbone-dim",
+            "8",
+            "--hidden-dim",
+            "8",
+            "--semantic-dim",
+            "4",
+            "--private-dim",
+            "4",
+            "--checkpoint-every",
+            "2",
+            "--log-every",
+            "1",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    checkpoint = torch.load(output / "checkpoint_000002.pt", map_location="cpu")
+    config = json.loads((output / "run_config.json").read_text(encoding="utf-8"))
+    metrics = [
+        json.loads(line)
+        for line in (output / "train_metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert checkpoint["step"] == 2
+    assert [row["step"] for row in metrics] == [1, 2]
+    assert config["world_size"] == 2
+    assert config["ddp_find_unused_parameters"] is True
 
 
 def test_paired_control_eligibility_keeps_only_same_take_different_phase_samples() -> None:
