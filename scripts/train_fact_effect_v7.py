@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from datetime import timedelta
 import hashlib
 import json
 import os
@@ -597,15 +598,32 @@ def validate_p1_cache_binding(
         raise ValueError("P1 provenance target identity differs from the active target cache")
 
 
+def distributed_timeout_seconds() -> int:
+    try:
+        seconds = int(os.environ.get("FACT_DDP_TIMEOUT_SECONDS", "120"))
+    except ValueError as error:
+        raise ValueError("FACT_DDP_TIMEOUT_SECONDS must be an integer") from error
+    if not 30 <= seconds <= 3600:
+        raise ValueError("FACT_DDP_TIMEOUT_SECONDS must be between 30 and 3600")
+    return seconds
+
+
 def init_distributed() -> tuple[int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size > 1:
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
-        if torch.cuda.is_available():
+        cuda_available = torch.cuda.is_available()
+        backend = "nccl" if cuda_available else "gloo"
+        # NCCL may create its communicator on the current CUDA device during
+        # process-group initialization. Bind each rank first so two local ranks
+        # cannot both initialize against the default physical GPU 0.
+        if cuda_available:
             torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend=backend,
+            timeout=timedelta(seconds=distributed_timeout_seconds()),
+        )
     return world_size, rank, local_rank
 
 
@@ -917,6 +935,10 @@ def main() -> None:
         "global_batch": args.micro_batch * args.gradient_accumulation * world_size,
         "world_size": world_size,
         "ddp_find_unused_parameters": world_size > 1,
+        "distributed_backend": dist.get_backend() if world_size > 1 else None,
+        "distributed_timeout_seconds": (
+            distributed_timeout_seconds() if world_size > 1 else None
+        ),
         "gradient_accumulation": args.gradient_accumulation,
         "quality_sampling": args.quality_sampling,
         "learning_rate": args.learning_rate,
@@ -987,6 +1009,9 @@ def main() -> None:
             "steps",
             "global_batch",
             "world_size",
+            "ddp_find_unused_parameters",
+            "distributed_backend",
+            "distributed_timeout_seconds",
             "gradient_accumulation",
             "step_unit",
             "learning_rate",

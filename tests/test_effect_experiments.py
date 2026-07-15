@@ -33,11 +33,51 @@ from fact_tokenizer.paired_eligibility import (
 )
 from scripts.train_fact_effect_v7 import (
     DeterministicDistributedWeightedSampler,
+    distributed_timeout_seconds,
+    init_distributed,
     load_excluded_takes,
     nuisance_inputs,
     require_control_assets,
     validate_formal_target_cache,
 )
+
+
+def test_nccl_binds_local_device_before_process_group_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("FACT_DDP_TIMEOUT_SECONDS", "47")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_device",
+        lambda rank: events.append(("set_device", rank)),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **kwargs: events.append(("init_process_group", kwargs)),
+    )
+
+    assert init_distributed() == (2, 1, 1)
+    assert events[0] == ("set_device", 1)
+    assert events[1][0] == "init_process_group"
+    kwargs = events[1][1]
+    assert isinstance(kwargs, dict)
+    assert kwargs["backend"] == "nccl"
+    assert kwargs["timeout"].total_seconds() == 47
+    assert distributed_timeout_seconds() == 47
+
+
+def test_distributed_timeout_contract_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FACT_DDP_TIMEOUT_SECONDS", "29")
+    with pytest.raises(ValueError, match="between 30 and 3600"):
+        distributed_timeout_seconds()
 
 
 def test_preregistered_experiment_matrix_and_batch_contract() -> None:
